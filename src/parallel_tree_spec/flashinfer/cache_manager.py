@@ -81,6 +81,7 @@ class KvCachePool:
 
     def reset(self):
         self.cache_data.zero_()
+        self.free_page_mask.fill_(True)
 
     def num_free_pages(self):
         return self.free_page_mask.sum().item()
@@ -277,3 +278,52 @@ def getKvCacheBatchPosition(
         batch_indices=batch_indices,
         positions=positions,
     )
+
+
+def copy_kv_pages(
+    src_pool: KvCachePool,
+    src_request: RequestKvCache,
+    dst_pool: KvCachePool,
+) -> RequestKvCache:
+    """Copy KV cache pages from source to destination pool.
+
+    Creates a new RequestKvCache in dst_pool with the same content as src_request.
+    Handles dtype conversion (e.g. bf16 → fp16) automatically.
+
+    Args:
+        src_pool: Source KV cache pool (e.g. target model's pool)
+        src_request: Source request cache to copy from
+        dst_pool: Destination KV cache pool (e.g. draft model's pool)
+
+    Returns:
+        New RequestKvCache in dst_pool with copied KV data
+    """
+    num_pages = len(src_request.kv_page_indices)
+    if num_pages == 0:
+        return RequestKvCache(
+            kvCachePool=dst_pool,
+            page_len=dst_pool.page_len,
+            seq_init_len=0,
+        )
+
+    # Allocate pages in destination
+    dst_pages = dst_pool.allocate(num_pages)
+
+    # Copy page data with dtype conversion
+    for src_page, dst_page in zip(src_request.kv_page_indices, dst_pages):
+        dst_pool.cache_data[:, dst_page].copy_(
+            src_pool.cache_data[:, src_page].to(dst_pool.dtype),
+            non_blocking=True,
+        )
+
+    # Build a RequestKvCache that mirrors the source's state
+    dst_request = RequestKvCache(
+        kvCachePool=dst_pool,
+        page_len=dst_pool.page_len,
+        seq_init_len=0,
+    )
+    dst_request.kv_page_indices = dst_pages
+    dst_request.kv_len = src_request.kv_len
+    dst_request.kv_last_page_len = src_request.kv_last_page_len
+
+    return dst_request

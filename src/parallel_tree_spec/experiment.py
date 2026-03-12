@@ -16,7 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .beam_search import BeamSearchConfig, beam_search
 from .flashinfer.attention_wrapper import BeFlashinferWrapper
-from .flashinfer.cache_manager import KvCachePool, RequestKvCache
+from .flashinfer.cache_manager import KvCachePool, RequestKvCache, copy_kv_pages
 from .flashinfer.monkey_patch import apply_flashinfer_kernel_to_llama
 from .metrics import QuantConfigResult, SingleRunMetrics, SweepResults
 from .quantization import make_quant_config, quantize_model
@@ -39,6 +39,7 @@ class BeamSearchExperiment:
         dtype: torch.dtype = torch.bfloat16,
         page_len: int = 16,
         max_pages: int = 4096,
+        share_kv: bool = False,
     ):
         self.model_name = model_name
         self.beam_width = beam_width
@@ -47,6 +48,7 @@ class BeamSearchExperiment:
         self.dtype = dtype
         self.page_len = page_len
         self.max_pages = max_pages
+        self.share_kv = share_kv
 
         self.tokenizer = None
         self.target_model = None
@@ -194,8 +196,6 @@ class BeamSearchExperiment:
         )
 
         # --- Target prefill ---
-        # We need to prefill the target model so it has KV cache for verification.
-        # First, run target prefill.
         target_kv_cache.increment(prompt_ids.shape[1])
         from .flashinfer.cache_manager import getKvCacheBatchPosition
 
@@ -215,7 +215,7 @@ class BeamSearchExperiment:
         position_ids = torch.arange(
             prompt_ids.shape[1], dtype=torch.long, device=self.device
         ).unsqueeze(0)
-        self.target_model(
+        target_outputs = self.target_model(
             prompt_ids,
             position_ids=position_ids,
             past_key_values=None,
@@ -234,12 +234,24 @@ class BeamSearchExperiment:
             use_cascade=True,
         )
 
+        prefilled_logits = None
+        if self.share_kv:
+            # Copy target's KV cache to draft pool (with dtype cast)
+            draft_kv_cache = copy_kv_pages(
+                src_pool=self.target_kv_pool,
+                src_request=target_kv_cache,
+                dst_pool=self.draft_kv_pool,
+            )
+            # Use target's prefill logits so draft skips its own prefill
+            prefilled_logits = target_outputs.logits
+
         tree, step_times = beam_search(
             model=self.draft_model,
             request_kv_cache=draft_kv_cache,
             input_ids=prompt_ids,
             config=beam_config,
             flashinfer_wrapper=self.draft_wrapper,
+            prefilled_logits=prefilled_logits,
         )
 
         # --- Verify: target model scores the tree ---

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -132,6 +132,7 @@ def beam_search(
     input_ids: torch.Tensor,
     config: BeamSearchConfig,
     flashinfer_wrapper: BeFlashinferWrapper,
+    prefilled_logits: Optional[torch.Tensor] = None,
 ) -> Tuple[Tree, List[float]]:
     """
     Run beam search on the draft model using FlashInfer paged attention.
@@ -142,6 +143,9 @@ def beam_search(
         input_ids: Prompt token IDs [1, seq_len]
         config: BeamSearchConfig with beam width, depth, etc.
         flashinfer_wrapper: FlashInfer attention wrapper
+        prefilled_logits: If provided, skip draft prefill and use these logits
+            directly. The request_kv_cache must already contain the KV data
+            (e.g., copied from the target model's prefill). Shape: [1, seq_len, vocab].
 
     Returns:
         tree: Draft tree containing all beam search candidates
@@ -161,32 +165,40 @@ def beam_search(
     if isinstance(kv_len, torch.Tensor):
         kv_len = kv_len.item()
 
-    # --- Prefill ---
+    # --- Prefill (or skip if using shared KV) ---
     t_prefill_start = time.perf_counter()
-    request_kv_cache.increment(input_len)
-    batch_position = getKvCacheBatchPosition(
-        request_kv_caches=[request_kv_cache],
-        mode="tree",
-        device=device,
-        treeTokens=input_len,
-    )
-    flashinfer_wrapper.prepareAttention(
-        "prefill", batch_position, PAGE_SIZE, "NONE", kvCachePool.cache_data[0].dtype,
-    )
-    position_ids = torch.arange(kv_len, kv_len + input_len, dtype=torch.long, device=device).unsqueeze(0)
-    outputs = model(
-        input_ids,
-        position_ids=position_ids,
-        past_key_values=None,
-        use_cache=False,
-        kvCachePool=kvCachePool,
-        batch_position=batch_position,
-        mode="prefill",
-        flashinferWrapper=flashinfer_wrapper,
-    )
-    logits = outputs.logits
-    kv_len += input_len
-    org_kv_len = kv_len
+
+    if prefilled_logits is not None:
+        # KV cache already populated (shared from target model).
+        # kv_len already accounts for prompt tokens.
+        logits = prefilled_logits
+        org_kv_len = kv_len
+    else:
+        # Draft model does its own prefill.
+        request_kv_cache.increment(input_len)
+        batch_position = getKvCacheBatchPosition(
+            request_kv_caches=[request_kv_cache],
+            mode="tree",
+            device=device,
+            treeTokens=input_len,
+        )
+        flashinfer_wrapper.prepareAttention(
+            "prefill", batch_position, PAGE_SIZE, "NONE", kvCachePool.cache_data[0].dtype,
+        )
+        position_ids = torch.arange(kv_len, kv_len + input_len, dtype=torch.long, device=device).unsqueeze(0)
+        outputs = model(
+            input_ids,
+            position_ids=position_ids,
+            past_key_values=None,
+            use_cache=False,
+            kvCachePool=kvCachePool,
+            batch_position=batch_position,
+            mode="prefill",
+            flashinferWrapper=flashinfer_wrapper,
+        )
+        logits = outputs.logits
+        kv_len += input_len
+        org_kv_len = kv_len
 
     # Cascade: shared prompt pages for level 0
     num_shared_pages = org_kv_len // PAGE_SIZE

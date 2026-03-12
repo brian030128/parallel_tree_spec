@@ -70,6 +70,10 @@ def main():
         help="Maximum number of KV cache pages (default: 4096)"
     )
     parser.add_argument(
+        "--share-kv", action="store_true",
+        help="Share target model's prefill KV cache with draft (subspec-style)"
+    )
+    parser.add_argument(
         "--output", type=str, default=None,
         help="Output file for results (default: stdout)"
     )
@@ -97,6 +101,7 @@ def main():
     logging.info(f"Beam width: {args.beam_width}, Max depth: {args.max_depth}")
     logging.info(f"Quant configs: {quant_configs}")
     logging.info(f"Prompts: {len(prompts)}")
+    logging.info(f"Share KV: {args.share_kv}")
 
     experiment = BeamSearchExperiment(
         model_name=args.model,
@@ -105,6 +110,7 @@ def main():
         device=args.device,
         page_len=args.page_len,
         max_pages=args.max_pages,
+        share_kv=args.share_kv,
     )
 
     results = experiment.run_sweep(prompts, quant_configs)
