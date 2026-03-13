@@ -7,8 +7,11 @@ prompts, and collects metrics across quantization configs.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
+import urllib.request
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
@@ -441,6 +444,77 @@ class BeamSearchExperiment:
             self.unload_draft_model()
 
         return results
+
+
+# ---------------------------------------------------------------------------
+# Download prompts at specific token lengths
+# ---------------------------------------------------------------------------
+
+GUTENBERG_DEFAULT_URL = "https://www.gutenberg.org/cache/epub/2600/pg2600.txt"
+
+
+def download_length_prompts(
+    tokenizer,
+    token_lengths: List[int],
+    url: str = GUTENBERG_DEFAULT_URL,
+) -> List[Tuple[int, str]]:
+    """Download a long text and create prompts at exact token lengths.
+
+    Args:
+        tokenizer: HuggingFace tokenizer for encoding/decoding.
+        token_lengths: List of desired prompt lengths in tokens.
+        url: URL to a plain-text source (default: War and Peace from Gutenberg).
+
+    Returns:
+        List of (token_length, prompt_string) tuples.
+    """
+    # Cache downloaded text locally to avoid re-downloading
+    cache_dir = Path.home() / ".cache" / "parallel_tree_spec"
+    url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+    cache_path = cache_dir / f"prompt_source_{url_hash}.txt"
+
+    if cache_path.exists():
+        logger.info(f"Loading cached text from {cache_path}")
+        text = cache_path.read_text(encoding="utf-8")
+    else:
+        logger.info(f"Downloading text from {url}")
+        with urllib.request.urlopen(url) as resp:
+            raw_text = resp.read().decode("utf-8")
+
+        # Strip Project Gutenberg header/footer
+        start_marker = "*** START OF"
+        end_marker = "*** END OF"
+        start_idx = raw_text.find(start_marker)
+        if start_idx != -1:
+            start_idx = raw_text.index("\n", start_idx) + 1
+        else:
+            start_idx = 0
+        end_idx = raw_text.find(end_marker)
+        if end_idx == -1:
+            end_idx = len(raw_text)
+        text = raw_text[start_idx:end_idx]
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(text, encoding="utf-8")
+        logger.info(f"Cached text to {cache_path}")
+
+    logger.info(f"Text: {len(text)} chars, tokenizing...")
+    all_tokens = tokenizer.encode(text)
+    logger.info(f"Total tokens: {len(all_tokens)}")
+
+    prompts = []
+    for length in sorted(token_lengths):
+        if length > len(all_tokens):
+            logger.warning(
+                f"Source text has only {len(all_tokens)} tokens, "
+                f"skipping requested length {length}"
+            )
+            continue
+        prompt_str = tokenizer.decode(all_tokens[:length])
+        prompts.append((length, prompt_str))
+        logger.info(f"  Created prompt with {length} tokens")
+
+    return prompts
 
 
 # ---------------------------------------------------------------------------

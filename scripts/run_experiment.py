@@ -16,7 +16,12 @@ import logging
 import sys
 from typing import List, Tuple
 
-from parallel_tree_spec.experiment import BeamSearchExperiment, DEFAULT_PROMPTS
+from parallel_tree_spec.experiment import (
+    BeamSearchExperiment,
+    DEFAULT_PROMPTS,
+    GUTENBERG_DEFAULT_URL,
+    download_length_prompts,
+)
 
 
 def parse_quant_configs(config_str: str) -> List[Tuple[int, int]]:
@@ -86,6 +91,15 @@ def main():
         help="Number of warm-up iterations per quant config before timed runs (default: 1)"
     )
     parser.add_argument(
+        "--prompt-lengths", type=str, default=None,
+        help="Comma-separated token lengths for prompts (e.g., '16,128,256,1024,4096,16384,65536'). "
+             "Downloads a long text and slices to exact token lengths. Overrides --num-prompts."
+    )
+    parser.add_argument(
+        "--prompt-source-url", type=str, default=GUTENBERG_DEFAULT_URL,
+        help="URL to download source text for --prompt-lengths (default: War and Peace from Gutenberg)"
+    )
+    parser.add_argument(
         "--output", type=str, default=None,
         help="Output file for results (default: stdout)"
     )
@@ -102,12 +116,25 @@ def main():
     )
 
     quant_configs = parse_quant_configs(args.quant_configs)
-    prompts = DEFAULT_PROMPTS[:args.num_prompts]
 
-    if len(prompts) < args.num_prompts:
-        logging.warning(
-            f"Only {len(prompts)} default prompts available (requested {args.num_prompts})"
+    if args.prompt_lengths:
+        # Load tokenizer early to create length-specific prompts
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        token_lengths = [int(x.strip()) for x in args.prompt_lengths.split(",")]
+        length_prompts = download_length_prompts(
+            tokenizer, token_lengths, url=args.prompt_source_url
         )
+        prompts = []
+        for tok_len, prompt_str in length_prompts:
+            logging.info(f"Prompt: {tok_len} tokens")
+            prompts.append(prompt_str)
+    else:
+        prompts = DEFAULT_PROMPTS[:args.num_prompts]
+        if len(prompts) < args.num_prompts:
+            logging.warning(
+                f"Only {len(prompts)} default prompts available (requested {args.num_prompts})"
+            )
 
     logging.info(f"Model: {args.model}")
     logging.info(f"Beam width: {args.beam_width}, Max depth: {args.max_depth}")
