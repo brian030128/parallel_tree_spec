@@ -22,6 +22,7 @@ class SingleRunMetrics:
     verify_time: float                       # target forward + verify time (seconds)
     tree_size: int                           # total nodes in draft tree
     tree_depth: int                          # max depth of draft tree
+    target_decode_time: float = 0.0              # single-token target decode (seconds)
     per_depth_accepted: Dict[int, bool] = field(default_factory=dict)
     # depth -> was token at this depth accepted?
 
@@ -55,6 +56,13 @@ class QuantConfigResult:
         if not self.runs:
             return 0.0
         return sum(r.verify_time for r in self.runs) / len(self.runs)
+
+    @property
+    def mean_target_decode_time(self) -> float:
+        """Mean single-token target decode time."""
+        if not self.runs:
+            return 0.0
+        return sum(r.target_decode_time for r in self.runs) / len(self.runs)
 
     @property
     def mean_step_time(self) -> float:
@@ -101,7 +109,7 @@ class SweepResults:
         lines.append("")
 
         # Header
-        header = f"{'Config':>12s} | {'Runs':>5s} | {'Accept':>7s} | {'Draft(ms)':>10s} | {'Step(ms)':>9s} | {'Verify(ms)':>11s}"
+        header = f"{'Config':>12s} | {'Runs':>5s} | {'Accept':>7s} | {'Draft(ms)':>10s} | {'Step(ms)':>9s} | {'Verify(ms)':>11s} | {'Target(ms)':>11s}"
         lines.append(header)
         lines.append("-" * len(header))
 
@@ -112,7 +120,8 @@ class SweepResults:
                 f"{cfg.mean_accept_len:>7.2f} | "
                 f"{cfg.mean_draft_time * 1000:>10.2f} | "
                 f"{cfg.mean_step_time * 1000:>9.2f} | "
-                f"{cfg.mean_verify_time * 1000:>11.2f}"
+                f"{cfg.mean_verify_time * 1000:>11.2f} | "
+                f"{cfg.mean_target_decode_time * 1000:>11.2f}"
             )
 
         lines.append("")

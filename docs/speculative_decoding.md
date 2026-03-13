@@ -66,6 +66,21 @@ EXACT VERIFICATION:
 **Why tree attention?**
 Without tree attention, the target model would need one forward pass per beam path (K passes). With tree attention, shared prefix computation is amortized, and all paths are verified in a single forward pass.
 
+### Tree Attention Mask: Dimension Requirements
+
+The tree attention mask is a boolean tensor of shape `[N, kv_len]` where `N` is the number of tree nodes and `kv_len` is the total KV cache length (prompt tokens + tree tokens). Getting this shape exactly right is critical.
+
+**Prefix length must equal `prompt_len`, not `prompt_len - 1`.**
+
+The KV cache during verification contains `prompt_len + N` entries: the prompt's KV (from prefill) plus the `N` tree token KVs appended during tree decode. The mask's column count must match this exactly. When building the mask via `tree.create_attention_mask(prefix_length=...)`:
+
+- `prefix_length = prompt_len` → mask shape `[N, prompt_len + N]` → matches KV length ✓
+- `prefix_length = prompt_len - 1` → mask shape `[N, prompt_len - 1 + N]` → **one column short** ✗
+
+With the new FlashInfer API (`plan()`), the mask tensor is sized exactly — no pre-allocated buffer to absorb overreads. An off-by-one here causes FlashInfer to read past the mask boundary, producing garbage attention patterns and wrong logits.
+
+Note: `position_offset` (used for RoPE position IDs) is `prompt_len - 1` because tree node depths are 1-indexed (root = depth 1, position = prompt_len). The prefix length for the mask is a separate concept — it counts how many KV entries precede the tree in the cache, which is `prompt_len`.
+
 ## Acceptance Rate and Depth
 
 The key metric is **accepted tokens per depth**. For each depth d in the draft tree:

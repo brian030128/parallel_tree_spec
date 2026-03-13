@@ -40,6 +40,9 @@ class BeamSearchExperiment:
         page_len: int = 16,
         max_pages: int = 4096,
         share_kv: bool = False,
+        temperature: float = 1.0,
+        use_cuda_graph: bool = False,
+        warmup_iters: int = 1,
     ):
         self.model_name = model_name
         self.beam_width = beam_width
@@ -49,6 +52,9 @@ class BeamSearchExperiment:
         self.page_len = page_len
         self.max_pages = max_pages
         self.share_kv = share_kv
+        self.temperature = temperature
+        self.use_cuda_graph = use_cuda_graph
+        self.warmup_iters = warmup_iters
 
         self.tokenizer = None
         self.target_model = None
@@ -58,6 +64,7 @@ class BeamSearchExperiment:
         self.draft_model = None
         self.draft_kv_pool = None
         self.draft_wrapper = None
+        self.draft_cuda_runner = None
 
     def load_tokenizer(self):
         """Load tokenizer."""
@@ -117,7 +124,7 @@ class BeamSearchExperiment:
         logger.info(f"Loading draft model: {self.model_name} (HQQ {nbits}b/g{group_size})")
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             device_map=self.device,
         )
         model.eval()
@@ -154,6 +161,44 @@ class BeamSearchExperiment:
         self.draft_model = model
         logger.info(f"Draft model loaded (HQQ {nbits}b/g{group_size})")
 
+    def load_draft_model_unquantized(self):
+        """Load unquantized bf16 draft model (same as target, for baseline)."""
+        self.load_tokenizer()
+
+        logger.info(f"Loading draft model (unquantized bf16): {self.model_name}")
+        model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.bfloat16,
+            device_map=self.device,
+        )
+        model.eval()
+        apply_flashinfer_kernel_to_llama(model)
+
+        config = model.config
+        num_layers = config.num_hidden_layers
+        num_kv_heads = config.num_key_value_heads
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+
+        self.draft_kv_pool = KvCachePool(
+            max_pages=self.max_pages,
+            num_layers=num_layers,
+            num_heads=num_kv_heads,
+            head_dim=head_dim,
+            page_len=self.page_len,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+
+        self.draft_wrapper = BeFlashinferWrapper(
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=num_kv_heads,
+            hidden_size=config.hidden_size,
+            page_len=self.page_len,
+        )
+
+        self.draft_model = model
+        logger.info("Draft model loaded (unquantized baseline)")
+
     def unload_draft_model(self):
         """Free draft model memory."""
         if self.draft_model is not None:
@@ -165,6 +210,9 @@ class BeamSearchExperiment:
         if self.draft_wrapper is not None:
             del self.draft_wrapper
             self.draft_wrapper = None
+        if self.draft_cuda_runner is not None:
+            del self.draft_cuda_runner
+            self.draft_cuda_runner = None
         torch.cuda.empty_cache()
 
     def run_single(self, prompt_ids: torch.Tensor) -> SingleRunMetrics:
@@ -226,12 +274,48 @@ class BeamSearchExperiment:
             flashinferWrapper=self.target_wrapper,
         )
 
+        # --- Target single-token decode benchmark ---
+        test_token_id = target_outputs.logits[0, -1, :].argmax().item()
+        test_input = torch.tensor([[test_token_id]], dtype=torch.long, device=self.device)
+        test_pos = torch.tensor([[prompt_ids.shape[1]]], dtype=torch.long, device=self.device)
+
+        target_kv_cache.increment(1)
+        target_decode_pos = getKvCacheBatchPosition(
+            request_kv_caches=[target_kv_cache],
+            mode="tree",
+            device=self.device,
+            treeTokens=1,
+        )
+        self.target_wrapper.prepareAttention(
+            "decode", target_decode_pos, self.page_len, "NONE",
+            self.target_kv_pool.cache_data[0].dtype,
+        )
+
+        torch.cuda.synchronize()
+        t_target_decode_start = time.perf_counter()
+        self.target_model(
+            test_input,
+            position_ids=test_pos,
+            past_key_values=None,
+            use_cache=False,
+            kvCachePool=self.target_kv_pool,
+            batch_position=target_decode_pos,
+            mode="decode",
+            flashinferWrapper=self.target_wrapper,
+        )
+        torch.cuda.synchronize()
+        target_decode_time = time.perf_counter() - t_target_decode_start
+
+        # Undo the KV increment so verification sees the original state
+        target_kv_cache.decrement(1)
+
         # --- Draft: beam search ---
         beam_config = BeamSearchConfig(
             topk_len=self.beam_width,
             max_depth=self.max_depth,
-            temperature=1.0,
+            temperature=self.temperature,
             use_cascade=True,
+            use_cuda_graph=self.use_cuda_graph,
         )
 
         prefilled_logits = None
@@ -245,14 +329,16 @@ class BeamSearchExperiment:
             # Use target's prefill logits so draft skips its own prefill
             prefilled_logits = target_outputs.logits
 
-        tree, step_times = beam_search(
+        tree, step_times, cuda_runner = beam_search(
             model=self.draft_model,
             request_kv_cache=draft_kv_cache,
             input_ids=prompt_ids,
             config=beam_config,
             flashinfer_wrapper=self.draft_wrapper,
             prefilled_logits=prefilled_logits,
+            cuda_graph_runner=self.draft_cuda_runner,
         )
+        self.draft_cuda_runner = cuda_runner
 
         # --- Verify: target model scores the tree ---
         eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
@@ -282,6 +368,7 @@ class BeamSearchExperiment:
             verify_time=verify_result.verify_time,
             tree_size=tree.current_size,
             tree_depth=tree.get_depth(),
+            target_decode_time=target_decode_time,
             per_depth_accepted=per_depth,
         )
 
@@ -310,11 +397,26 @@ class BeamSearchExperiment:
 
         for nbits, group_size in quant_configs:
             logger.info(f"\n{'='*60}")
-            logger.info(f"Config: {nbits}b / g{group_size}")
+            if nbits == 0:
+                logger.info("Config: unquantized bf16 (baseline)")
+            else:
+                logger.info(f"Config: {nbits}b / g{group_size}")
             logger.info(f"{'='*60}")
 
-            self.load_draft_model(nbits=nbits, group_size=group_size)
+            if nbits == 0:
+                self.load_draft_model_unquantized()
+            else:
+                self.load_draft_model(nbits=nbits, group_size=group_size)
             config_result = QuantConfigResult(nbits=nbits, group_size=group_size)
+
+            # Warm-up: run draft+verify cycles to JIT-compile CUDA kernels
+            if self.warmup_iters > 0:
+                warmup_ids = self.tokenizer.encode(prompts[0], return_tensors="pt").to(self.device)
+                for wi in range(self.warmup_iters):
+                    logger.info(f"  Warm-up {wi+1}/{self.warmup_iters}...")
+                    self.run_single(warmup_ids)
+                torch.cuda.synchronize()
+                logger.info("  Warm-up complete")
 
             for i, prompt in enumerate(prompts):
                 logger.info(f"  Prompt {i+1}/{len(prompts)}: {prompt[:60]}...")
@@ -327,7 +429,8 @@ class BeamSearchExperiment:
                         f"    Accept: {metrics.accept_len}/{metrics.total_len}, "
                         f"Tree: {metrics.tree_size} nodes, "
                         f"Draft: {sum(metrics.draft_step_times)*1000:.1f}ms, "
-                        f"Verify: {metrics.verify_time*1000:.1f}ms"
+                        f"Verify: {metrics.verify_time*1000:.1f}ms, "
+                        f"Target: {metrics.target_decode_time*1000:.1f}ms"
                     )
                 except Exception as e:
                     logger.error(f"    Failed: {e}")

@@ -183,6 +183,7 @@ class BeFlashinferWrapper:
         Args:
             mode: "prefill", "decode", or "tree"
             batch_position: KvCacheBatchPosition describing the batch
+            dtype: query data type (activation dtype)
             attention_mask: custom attention mask (only for "tree" mode)
         """
         if mode == "tree" and attention_mask is not None:
@@ -221,7 +222,7 @@ class BeFlashinferWrapper:
                 num_kv_heads=self.num_key_value_heads,
                 head_dim=self._head_padded_dim,
                 page_size=page_len,
-                data_type=dtype,
+                q_data_type=dtype,
             )
         else:
             raise ValueError(f"Invalid attention mode: {mode}")

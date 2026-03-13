@@ -33,22 +33,23 @@ config = BaseQuantizeConfig(
 
 ## Per-Layer Quantization Config
 
-We quantize ALL attention and MLP linear layers uniformly:
+We quantize ALL attention and MLP linear layers uniformly. Our `make_quant_config` uses HQQ's short "linear_tag" convention (e.g. `self_attn.q_proj`), which the stock `AutoHQQHFModel` maps to all matching layers across all transformer blocks.
+
+Note: subspec_v2 uses a custom `AutoHQQHFModel` subclass that overrides `name_to_linear_tag` to use fully-qualified names (e.g. `model.layers.0.self_attn.q_proj`). Both approaches work; the short-tag style is simpler for uniform quantization.
 
 ```python
 def make_quant_config(model, nbits=4, group_size=64, axis=1):
     """Generate per-layer HQQ quantization config."""
     quant_config = {}
-    config = BaseQuantizeConfig(nbits=nbits, group_size=group_size, axis=axis)
-
-    for i in range(len(model.model.layers)):
-        # Attention projections
-        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
-            quant_config[f"model.layers.{i}.self_attn.{proj}"] = config
-        # MLP projections
-        for proj in ["gate_proj", "up_proj", "down_proj"]:
-            quant_config[f"model.layers.{i}.mlp.{proj}"] = config
-
+    # Short tags — applied to all layers by AutoHQQHFModel
+    for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+        quant_config[f"self_attn.{proj}"] = BaseQuantizeConfig(
+            nbits=nbits, group_size=group_size, axis=axis
+        )
+    for proj in ["gate_proj", "up_proj", "down_proj"]:
+        quant_config[f"mlp.{proj}"] = BaseQuantizeConfig(
+            nbits=nbits, group_size=group_size, axis=axis
+        )
     return quant_config
 ```
 
@@ -74,6 +75,11 @@ HQQLinear.set_backend(HQQBackend.PYTORCH)
 
 # Step 3: Patch with GemLite optimized kernels
 prepare_for_inference(model, backend="gemlite")
+
+# Step 4: IMPORTANT — reset eval mode
+# prepare_for_inference replaces HQQLinear modules with GemLiteLinearTriton
+# modules that default to training=True. Must call model.eval() AFTER patching.
+model.eval()
 ```
 
 ### GemLite Backend
@@ -86,6 +92,60 @@ Requirements for GemLite:
 - `nbits` in {1, 2, 4} (note: 3-bit not supported by GemLite, falls back to PyTorch)
 - `axis=1` (column-wise quantization)
 - `compute_dtype=float16`
+
+After patching, linear layers become `GemLiteLinearTriton` instances. Verify with:
+```python
+for name, mod in model.named_modules():
+    if 'q_proj' in name:
+        print(type(mod).__name__)  # Should print: GemLiteLinearTriton
+        break
+```
+
+### GemLite Environment Knobs (subspec_v2)
+
+subspec_v2's `HqqQuantizer` supports these env vars for GemLite tuning:
+- `GEMLITE_AUTOTUNE` — autotune mode
+- `GEMLITE_CONFIG` — path to a config JSON
+- `SUBSPEC_GEMLITE_PACKING_BITWIDTH` — packing width
+- `SUBSPEC_GEMLITE_KERNEL_CACHING` — enable/disable kernel caching
+- `SUBSPEC_GEMLITE_ACTIVATIONS=fp8` — use FP8 dynamic activation quantization
+
+## Performance: GPU-Fast but CPU-Bound
+
+### Profiling Results (RTX 6000 Ada, Llama-3.1-8B, single-token decode)
+
+**CUDA kernel time** (what the GPU actually spends):
+
+| Component | Target (bf16) | Draft (HQQ 4b/g64) |
+|-----------|--------------|---------------------|
+| Linear layers | 17.7ms (cuBLAS gemvx, 225 calls) | 6.0ms (Triton gemv_revsplitK, 224 calls) |
+| Total CUDA | 19.9ms | 9.8ms |
+
+GemLite's Triton kernels are ~3x faster than bf16 cuBLAS for the linear layers on GPU.
+
+**Wall-clock time** (what you actually measure):
+
+| | Target (bf16) | Draft (HQQ 4b/g64) |
+|---|---|---|
+| Median decode | 23.7ms | 46.6ms |
+
+The draft appears **2x slower** despite faster GPU kernels. The bottleneck is **CPU-side dispatch overhead**:
+
+- `gemlite::forward_functional`: 27.5ms self CPU time (224 calls × ~123μs each)
+- `aten::zeros`: 6ms — GemLite allocates a fresh output tensor per call
+- Total CPU time: **56ms** vs ~10ms CUDA time
+
+Each GemLite Triton kernel launch involves Python-side argument packing, JIT cache lookup, and output tensor allocation. For 224 calls per forward pass, this dominates.
+
+### Why cuBLAS Doesn't Have This Problem
+
+cuBLAS GEMV launches are thin C++ calls with ~2-5μs overhead each. Triton kernels go through Python → triton runtime → CUDA launch, costing ~120μs+ each.
+
+### The Fix: torch.compile / CUDA Graphs
+
+The subspec_v2 config uses `compile_mode: max-autotune-no-cudagraphs` to eliminate per-call Python overhead. `torch.compile` traces the full forward pass and fuses kernel launches, removing the Python dispatch bottleneck.
+
+Without compilation, the HQQ draft model is **slower** than bf16 for single-token decode despite faster GPU kernels. This is a critical detail for any benchmark or production use.
 
 ## HQQ + FlashInfer: Orthogonal Composition
 
@@ -116,6 +176,14 @@ Next Layer
 
 **Key insight**: HQQ quantizes the linear projection **weights**. The activations (including Q, K, V tensors) remain in full precision (FP16). FlashInfer operates on these full-precision activations, so it's completely unaware of quantization.
 
+### dtype Flow
+
+- Model loaded as bf16
+- FlashInfer patches applied (replaces LlamaAttention with FiLlamaAttention)
+- HQQ quantization casts non-linear layers (norms, embed, lm_head) to fp16 via `_patch_other`
+- GemLite layers produce fp16 activations
+- KV cache must be fp16 (matching activation dtype, not the original bf16)
+
 ## Installation
 
 ```bash
@@ -143,12 +211,16 @@ For Llama-3.1-8B (7B parameters in linear layers):
 
 1. **3-bit not supported by GemLite**: Falls back to PyTorch dequantize + matmul (slower)
 2. **axis=0** gives better quality but is slower (not optimized by GemLite)
-3. **CUDA graphs**: HQQ linear layers are compatible with CUDA graph capture
-4. **Accuracy**: Lower bits → more quantization error → lower acceptance rate (this is what we measure)
+3. **training=True after patching**: `prepare_for_inference` creates new `GemLiteLinearTriton` modules that default to `training=True`. Must call `model.eval()` after patching.
+4. **CPU-bound without torch.compile**: Triton kernel dispatch overhead (~123μs/call × 224 calls = 27ms) makes uncompiled HQQ models slower than bf16 for single-token decode. torch.compile is required for actual speedup.
+5. **Accuracy**: Lower bits → more quantization error → lower acceptance rate (this is what we measure)
 
 ## Reference Files
 
 - HQQ library: `/home/brain_l/flashtree/base/hqq/`
 - HQQ README: `/home/brain_l/flashtree/base/hqq/Readme.md`
 - Quantizer wrapper: `subspec_v2/specdecodes/helpers/quantizers/hqq/__init__.py`
-- Recipe example: `subspec_v2/specdecodes/helpers/recipes/quant/hqq_4bit.py`
+- Custom AutoHQQHFModel: `subspec_v2/specdecodes/helpers/quantizers/hqq/hf/base.py`
+- Recipe example: `subspec_v2/specdecodes/helpers/recipes/subspec/hqq_4bit_postspec.py`
+- GemLite source: `.venv/lib/python3.12/site-packages/gemlite/core.py`
+- Benchmark script: `scripts/bench_decode_latency.py`

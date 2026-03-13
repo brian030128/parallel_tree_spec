@@ -74,6 +74,18 @@ def main():
         help="Share target model's prefill KV cache with draft (subspec-style)"
     )
     parser.add_argument(
+        "--temperature", type=float, default=1.0,
+        help="Beam search temperature (default: 1.0, SubSpec uses 0.2)"
+    )
+    parser.add_argument(
+        "--no-cuda-graph", action="store_true",
+        help="Disable CUDA graph capture for beam search decode steps (enabled by default)"
+    )
+    parser.add_argument(
+        "--warmup-iters", type=int, default=1,
+        help="Number of warm-up iterations per quant config before timed runs (default: 1)"
+    )
+    parser.add_argument(
         "--output", type=str, default=None,
         help="Output file for results (default: stdout)"
     )
@@ -102,6 +114,9 @@ def main():
     logging.info(f"Quant configs: {quant_configs}")
     logging.info(f"Prompts: {len(prompts)}")
     logging.info(f"Share KV: {args.share_kv}")
+    logging.info(f"Temperature: {args.temperature}")
+    logging.info(f"CUDA graph: {not args.no_cuda_graph}")
+    logging.info(f"Warm-up iters: {args.warmup_iters}")
 
     experiment = BeamSearchExperiment(
         model_name=args.model,
@@ -111,6 +126,9 @@ def main():
         page_len=args.page_len,
         max_pages=args.max_pages,
         share_kv=args.share_kv,
+        temperature=args.temperature,
+        use_cuda_graph=not args.no_cuda_graph,
+        warmup_iters=args.warmup_iters,
     )
 
     results = experiment.run_sweep(prompts, quant_configs)

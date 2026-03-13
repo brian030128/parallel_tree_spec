@@ -41,6 +41,7 @@ class BeamSearchConfig:
     max_depth: int = 10        # number of decode steps
     temperature: float = 1.0   # softmax temperature
     use_cascade: bool = True   # use cascade attention for shared prompt pages
+    use_cuda_graph: bool = False  # capture decode steps in a CUDA graph
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +123,126 @@ def _build_cascade_data(
 
 
 # ---------------------------------------------------------------------------
+# CUDA graph runner
+# ---------------------------------------------------------------------------
+
+class CudaGraphRunner:
+    """Captures and replays a CUDA graph for beam search decode steps."""
+
+    def __init__(self, K: int, max_num_pages: int, device: torch.device):
+        self.K = K
+        self.device = device
+        self.graph: Optional[torch.cuda.CUDAGraph] = None
+        self.static_output = None
+
+        # Static input buffers
+        self.input_ids_buf = torch.zeros((K, 1), dtype=torch.long, device=device)
+        self.position_ids_buf = torch.zeros((K, 1), dtype=torch.long, device=device)
+
+        # Static batch position buffers (reused across replays)
+        self.batch_position = KvCacheBatchPosition(
+            seq_indptr=torch.arange(K + 1, dtype=torch.int32, device=device),
+            kv_page_indptr=torch.zeros(K + 1, dtype=torch.int32, device=device),
+            kv_page_indices=torch.zeros(max_num_pages, dtype=torch.int32, device=device),
+            kv_last_page_len=torch.zeros(K, dtype=torch.int32, device=device),
+            batch_indices=torch.arange(K, dtype=torch.int32, device=device),
+            positions=torch.zeros(K, dtype=torch.int32, device=device),
+        )
+
+    def capture(
+        self,
+        model: torch.nn.Module,
+        flashinfer_wrapper: "BeFlashinferWrapper",
+        kvCachePool: KvCachePool,
+        page_size: int,
+        dtype: torch.dtype,
+    ):
+        """Warm up the model and capture a CUDA graph for decode forward."""
+        K = self.K
+        device = self.device
+
+        # Allocate K temp pages for warmup
+        temp_pages = kvCachePool.allocate(K)
+
+        # Fill staging buffers pointing to temp pages (1 page per beam)
+        self.input_ids_buf.fill_(0)
+        self.position_ids_buf.fill_(0)
+        indptr = torch.arange(K + 1, dtype=torch.int32, device=device)
+        self.batch_position.kv_page_indptr.copy_(indptr)
+        self.batch_position.kv_page_indices[:K].copy_(
+            torch.tensor(temp_pages, dtype=torch.int32, device=device)
+        )
+        self.batch_position.kv_last_page_len.fill_(1)
+        self.batch_position.positions.fill_(0)
+
+        # 2 warmup forwards (populate internal buffers, JIT paths, etc.)
+        for _ in range(2):
+            flashinfer_wrapper.prepareAttention(
+                "decode", self.batch_position, page_size, "NONE", dtype,
+            )
+            model(
+                self.input_ids_buf,
+                position_ids=self.position_ids_buf,
+                past_key_values=None,
+                use_cache=False,
+                kvCachePool=kvCachePool,
+                batch_position=self.batch_position,
+                mode="decode",
+                flashinferWrapper=flashinfer_wrapper,
+            )
+
+        # Capture
+        torch.cuda.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        flashinfer_wrapper.prepareAttention(
+            "decode", self.batch_position, page_size, "NONE", dtype,
+        )
+        with torch.cuda.graph(self.graph):
+            self.static_output = model(
+                self.input_ids_buf,
+                position_ids=self.position_ids_buf,
+                past_key_values=None,
+                use_cache=False,
+                kvCachePool=kvCachePool,
+                batch_position=self.batch_position,
+                mode="decode",
+                flashinferWrapper=flashinfer_wrapper,
+            )
+
+        # Free temp pages
+        kvCachePool.deallocate(temp_pages)
+
+    def replay(
+        self,
+        beam_input_ids: torch.Tensor,
+        beam_position_ids: torch.Tensor,
+        batch_position: KvCacheBatchPosition,
+        flashinfer_wrapper: "BeFlashinferWrapper",
+        page_size: int,
+        dtype: torch.dtype,
+    ):
+        """Copy real data into staging buffers, plan attention, replay graph."""
+        # Copy model inputs
+        self.input_ids_buf.copy_(beam_input_ids)
+        self.position_ids_buf.copy_(beam_position_ids)
+
+        # Copy batch position fields
+        self.batch_position.kv_page_indptr.copy_(batch_position.kv_page_indptr)
+        n_idx = batch_position.kv_page_indices.shape[0]
+        self.batch_position.kv_page_indices[:n_idx].copy_(batch_position.kv_page_indices)
+        self.batch_position.kv_last_page_len.copy_(batch_position.kv_last_page_len)
+        self.batch_position.positions.copy_(batch_position.positions)
+
+        # Plan attention (updates FlashInfer's pre-allocated decode buffers)
+        flashinfer_wrapper.prepareAttention(
+            "decode", self.batch_position, page_size, "NONE", dtype,
+        )
+
+        self.graph.replay()
+        return self.static_output
+
+
+# ---------------------------------------------------------------------------
 # Main beam search
 # ---------------------------------------------------------------------------
 
@@ -133,7 +254,8 @@ def beam_search(
     config: BeamSearchConfig,
     flashinfer_wrapper: BeFlashinferWrapper,
     prefilled_logits: Optional[torch.Tensor] = None,
-) -> Tuple[Tree, List[float]]:
+    cuda_graph_runner: Optional["CudaGraphRunner"] = None,
+) -> Tuple[Tree, List[float], Optional["CudaGraphRunner"]]:
     """
     Run beam search on the draft model using FlashInfer paged attention.
 
@@ -150,6 +272,7 @@ def beam_search(
     Returns:
         tree: Draft tree containing all beam search candidates
         step_times: List of per-step decode times in seconds
+        cuda_graph_runner: The CudaGraphRunner (persisted for reuse), or None
     """
     device = input_ids.device
     dtype = model.lm_head.weight.dtype
@@ -159,7 +282,6 @@ def beam_search(
     max_depth = config.max_depth
     kvCachePool = request_kv_cache.kvCachePool
     PAGE_SIZE = kvCachePool.page_len
-
     # --- KV length init ---
     kv_len = request_kv_cache.get_seq_length()
     if isinstance(kv_len, torch.Tensor):
@@ -200,10 +322,24 @@ def beam_search(
         kv_len += input_len
         org_kv_len = kv_len
 
+    # CUDA graph: force plain decode (skip cascade)
+    cuda_runner = None
+    if config.use_cuda_graph:
+        if cuda_graph_runner is not None and cuda_graph_runner.graph is not None:
+            # Reuse existing runner — do NOT reinit decode wrapper (graph holds
+            # references to the old wrapper's internal buffers).
+            cuda_runner = cuda_graph_runner
+        else:
+            flashinfer_wrapper.init_cuda_graph_decode(K, kvCachePool.max_pages, device)
+            if cuda_graph_runner is not None:
+                cuda_runner = cuda_graph_runner
+            else:
+                cuda_runner = CudaGraphRunner(K, kvCachePool.max_pages, device)
+
     # Cascade: shared prompt pages for level 0
     num_shared_pages = org_kv_len // PAGE_SIZE
     use_cascade = config.use_cascade
-    if not use_cascade:
+    if not use_cascade or cuda_runner is not None:
         num_shared_pages = 0
 
     # Init cascade if needed
@@ -276,7 +412,13 @@ def beam_search(
         )
         beam_position_ids = torch.full((K, 1), current_pos, dtype=torch.long, device=device)
 
-        if num_shared_pages > 0:
+        if cuda_runner is not None and cuda_runner.graph is not None:
+            # CUDA graph replay path
+            outputs = cuda_runner.replay(
+                beam_input_ids, beam_position_ids, batch_position,
+                flashinfer_wrapper, PAGE_SIZE, dtype,
+            )
+        elif num_shared_pages > 0:
             cascade_data = _build_cascade_data(
                 beam_pages_list, num_shared_pages, current_pos, PAGE_SIZE, device
             )
@@ -316,6 +458,12 @@ def beam_search(
                 mode="decode",
                 flashinferWrapper=flashinfer_wrapper,
             )
+            # Capture graph after first successful decode forward
+            if cuda_runner is not None and cuda_runner.graph is None:
+                cuda_runner.capture(
+                    model, flashinfer_wrapper, kvCachePool, PAGE_SIZE,
+                    dtype,
+                )
 
         logits = outputs.logits
 
@@ -390,4 +538,4 @@ def beam_search(
     for p in pages_to_free:
         kvCachePool.deallocate([p])
 
-    return tree, step_times
+    return tree, step_times, cuda_runner

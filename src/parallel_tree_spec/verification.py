@@ -104,7 +104,7 @@ def prepare_tree_inputs(
 
     # FlashInfer uses non-inverted boolean mask (True = can attend)
     tree_mask = tree.create_attention_mask(
-        prefix_length=position_offset, skip_nodes=skip_nodes, device=device
+        prefix_length=position_offset + 1, skip_nodes=skip_nodes, device=device
     )
 
     return tree_input_ids, tree_position_ids, tree_mask
