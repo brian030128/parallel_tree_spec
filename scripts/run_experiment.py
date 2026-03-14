@@ -136,6 +136,10 @@ def main():
              "Downloads a long text and slices to exact token lengths. Overrides --num-prompts."
     )
     parser.add_argument(
+        "--runs-per-length", type=int, default=3,
+        help="Number of runs per prompt length when using --prompt-lengths (default: 3)"
+    )
+    parser.add_argument(
         "--prompt-source-url", type=str, default=GUTENBERG_DEFAULT_URL,
         help="URL to download source text for --prompt-lengths (default: War and Peace from Gutenberg)"
     )
@@ -162,15 +166,13 @@ def main():
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         token_lengths = [int(x.strip()) for x in args.prompt_lengths.split(",")]
-        length_prompts = download_length_prompts(
-            tokenizer, token_lengths, url=args.prompt_source_url
+        prompts = download_length_prompts(
+            tokenizer, token_lengths,
+            runs_per_length=args.runs_per_length,
+            url=args.prompt_source_url,
         )
-        prompts = []
-        for tok_len, prompt_str in length_prompts:
-            logging.info(f"Prompt: {tok_len} tokens")
-            prompts.append(prompt_str)
     else:
-        prompts = DEFAULT_PROMPTS[:args.num_prompts]
+        prompts = [(0, p) for p in DEFAULT_PROMPTS[:args.num_prompts]]
         if len(prompts) < args.num_prompts:
             logging.warning(
                 f"Only {len(prompts)} default prompts available (requested {args.num_prompts})"

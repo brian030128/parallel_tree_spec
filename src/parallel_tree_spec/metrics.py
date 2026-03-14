@@ -25,6 +25,7 @@ class SingleRunMetrics:
     target_decode_time: float = 0.0              # single-token target decode (seconds)
     per_depth_accepted: Dict[int, bool] = field(default_factory=dict)
     # depth -> was token at this depth accepted?
+    prompt_length: int = 0                       # token length of prompt (0 = unknown)
 
 
 @dataclass
@@ -92,6 +93,30 @@ class QuantConfigResult:
                 result.setdefault(i, []).append(t)
         return result
 
+    def runs_by_prompt_length(self) -> Dict[int, List[SingleRunMetrics]]:
+        """Group runs by prompt_length. Only includes runs with prompt_length > 0."""
+        groups: Dict[int, List[SingleRunMetrics]] = {}
+        for r in self.runs:
+            if r.prompt_length > 0:
+                groups.setdefault(r.prompt_length, []).append(r)
+        return groups
+
+    @staticmethod
+    def _summarize_runs(runs: List[SingleRunMetrics]) -> dict:
+        """Compute mean stats from a list of runs."""
+        n = len(runs)
+        if n == 0:
+            return {}
+        return {
+            "n": n,
+            "accept": sum(r.accept_len for r in runs) / n,
+            "draft_ms": sum(sum(r.draft_step_times) for r in runs) / n * 1000,
+            "step_ms": sum(t for r in runs for t in r.draft_step_times)
+                       / max(sum(len(r.draft_step_times) for r in runs), 1) * 1000,
+            "verify_ms": sum(r.verify_time for r in runs) / n * 1000,
+            "target_ms": sum(r.target_decode_time for r in runs) / n * 1000,
+        }
+
 
 @dataclass
 class SweepResults:
@@ -149,5 +174,27 @@ class SweepResults:
                     step_label = "prefill" if idx == 0 else f"step {idx}"
                     lines.append(f"  {step_label}: {mean_t * 1000:.2f} ms")
                 lines.append("")
+
+        # Per-prompt-length breakdown (only when runs have prompt_length > 0)
+        for cfg in self.configs:
+            groups = cfg.runs_by_prompt_length()
+            if not groups:
+                continue
+            label = f"{cfg.nbits}b/g{cfg.group_size}"
+            lines.append(f"Per prompt-length breakdown ({label}):")
+            pl_header = (
+                f"  {'Prompt Len':>10s} | {'Runs':>5s} | {'Accept':>6s} | "
+                f"{'Draft(ms)':>9s} | {'Step(ms)':>8s} | {'Verify(ms)':>10s} | {'Target(ms)':>10s}"
+            )
+            lines.append(pl_header)
+            lines.append("  " + "-" * (len(pl_header) - 2))
+            for plen in sorted(groups.keys()):
+                s = QuantConfigResult._summarize_runs(groups[plen])
+                lines.append(
+                    f"  {plen:>10d} | {s['n']:>5d} | {s['accept']:>6.2f} | "
+                    f"{s['draft_ms']:>9.2f} | {s['step_ms']:>8.2f} | "
+                    f"{s['verify_ms']:>10.2f} | {s['target_ms']:>10.2f}"
+                )
+            lines.append("")
 
         return "\n".join(lines)

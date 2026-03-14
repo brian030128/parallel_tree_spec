@@ -387,13 +387,14 @@ class BeamSearchExperiment:
 
     def run_sweep(
         self,
-        prompts: List[str],
+        prompts: List[Tuple[int, str]],
         quant_configs: List[Tuple[int, int]],
     ) -> SweepResults:
         """Run full sweep across quantization configs and prompts.
 
         Args:
-            prompts: List of prompt strings
+            prompts: List of (prompt_length, prompt_string) tuples.
+                     prompt_length=0 means length is untracked.
             quant_configs: List of (nbits, group_size) tuples
 
         Returns:
@@ -424,19 +425,20 @@ class BeamSearchExperiment:
 
             # Warm-up: run draft+verify cycles to JIT-compile CUDA kernels
             if self.warmup_iters > 0:
-                warmup_ids = self.tokenizer.encode(prompts[0], return_tensors="pt").to(self.device)  # noqa: target device; run_single handles .to(draft_device)
+                warmup_ids = self.tokenizer.encode(prompts[0][1], return_tensors="pt").to(self.device)  # noqa: target device; run_single handles .to(draft_device)
                 for wi in range(self.warmup_iters):
                     logger.info(f"  Warm-up {wi+1}/{self.warmup_iters}...")
                     self.run_single(warmup_ids)
                 torch.cuda.synchronize()
                 logger.info("  Warm-up complete")
 
-            for i, prompt in enumerate(prompts):
+            for i, (prompt_length, prompt) in enumerate(prompts):
                 logger.info(f"  Prompt {i+1}/{len(prompts)}: {prompt[:60]}...")
                 prompt_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
 
                 try:
                     metrics = self.run_single(prompt_ids)
+                    metrics.prompt_length = prompt_length
                     config_result.runs.append(metrics)
                     logger.info(
                         f"    Accept: {metrics.accept_len}/{metrics.total_len}, "
@@ -449,6 +451,9 @@ class BeamSearchExperiment:
                     logger.error(f"    Failed: {e}")
                     import traceback
                     traceback.print_exc()
+
+                # Free fragmented CUDA memory between runs
+                torch.cuda.empty_cache()
 
             results.configs.append(config_result)
             self.unload_draft_model()
@@ -466,13 +471,19 @@ GUTENBERG_DEFAULT_URL = "https://www.gutenberg.org/cache/epub/2600/pg2600.txt"
 def download_length_prompts(
     tokenizer,
     token_lengths: List[int],
+    runs_per_length: int = 1,
     url: str = GUTENBERG_DEFAULT_URL,
 ) -> List[Tuple[int, str]]:
     """Download a long text and create prompts at exact token lengths.
 
+    For each requested length, creates ``runs_per_length`` prompts sliced from
+    different, non-overlapping offsets in the source text so that each run uses
+    distinct content.
+
     Args:
         tokenizer: HuggingFace tokenizer for encoding/decoding.
         token_lengths: List of desired prompt lengths in tokens.
+        runs_per_length: How many distinct prompts to create per length.
         url: URL to a plain-text source (default: War and Peace from Gutenberg).
 
     Returns:
@@ -519,17 +530,31 @@ def download_length_prompts(
         torch.save(torch.tensor(all_tokens), tok_cache_path)
         logger.info(f"Total tokens: {len(all_tokens)}, cached to {tok_cache_path}")
 
+    # Space needed: each run of each length requires a non-overlapping slice.
+    # We lay out slices contiguously: run0_len0, run0_len1, ..., run1_len0, ...
+    max_length = max(token_lengths) if token_lengths else 0
+    total_needed = max_length * runs_per_length
+    if total_needed > len(all_tokens):
+        logger.warning(
+            f"Source text has {len(all_tokens)} tokens but need "
+            f"{total_needed} for {runs_per_length} non-overlapping runs "
+            f"at max length {max_length}. Runs will overlap."
+        )
+
     prompts = []
     for length in sorted(token_lengths):
-        if length > len(all_tokens):
-            logger.warning(
-                f"Source text has only {len(all_tokens)} tokens, "
-                f"skipping requested length {length}"
-            )
-            continue
-        prompt_str = tokenizer.decode(all_tokens[:length])
-        prompts.append((length, prompt_str))
-        logger.info(f"  Created prompt with {length} tokens")
+        for run_idx in range(runs_per_length):
+            offset = run_idx * max_length
+            end = offset + length
+            if end > len(all_tokens):
+                logger.warning(
+                    f"Not enough tokens for run {run_idx+1} at length {length} "
+                    f"(need offset {offset}+{length}={end}, have {len(all_tokens)}), skipping"
+                )
+                continue
+            prompt_str = tokenizer.decode(all_tokens[offset:end])
+            prompts.append((length, prompt_str))
+            logger.info(f"  Created prompt with {length} tokens (run {run_idx+1}, offset {offset})")
 
     return prompts
 
