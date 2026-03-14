@@ -508,9 +508,16 @@ def download_length_prompts(
         cache_path.write_text(text, encoding="utf-8")
         logger.info(f"Cached text to {cache_path}")
 
-    logger.info(f"Text: {len(text)} chars, tokenizing...")
-    all_tokens = tokenizer.encode(text)
-    logger.info(f"Total tokens: {len(all_tokens)}")
+    # Cache tokenized result to avoid re-tokenizing ~770k tokens each run
+    tok_cache_path = cache_dir / f"prompt_tokens_{url_hash}.pt"
+    if tok_cache_path.exists():
+        all_tokens = torch.load(tok_cache_path, weights_only=True).tolist()
+        logger.info(f"Loaded {len(all_tokens)} cached tokens from {tok_cache_path}")
+    else:
+        logger.info(f"Text: {len(text)} chars, tokenizing...")
+        all_tokens = tokenizer.encode(text)
+        torch.save(torch.tensor(all_tokens), tok_cache_path)
+        logger.info(f"Total tokens: {len(all_tokens)}, cached to {tok_cache_path}")
 
     prompts = []
     for length in sorted(token_lengths):
