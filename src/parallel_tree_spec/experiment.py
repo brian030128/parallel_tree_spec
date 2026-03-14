@@ -337,15 +337,20 @@ class BeamSearchExperiment:
             # Use target's prefill logits so draft skips its own prefill
             prefilled_logits = target_outputs.logits.to(self.draft_device)
 
-        tree, step_times, cuda_runner = beam_search(
-            model=self.draft_model,
-            request_kv_cache=draft_kv_cache,
-            input_ids=prompt_ids.to(self.draft_device),
-            config=beam_config,
-            flashinfer_wrapper=self.draft_wrapper,
-            prefilled_logits=prefilled_logits,
-            cuda_graph_runner=self.draft_cuda_runner,
-        )
+        # GemLite Triton kernels launch on torch.cuda.current_device(), not
+        # on the tensor's device.  After target prefill the current device is
+        # self.device; we must switch to draft_device so Triton targets the
+        # correct GPU.
+        with torch.cuda.device(self.draft_device):
+            tree, step_times, cuda_runner = beam_search(
+                model=self.draft_model,
+                request_kv_cache=draft_kv_cache,
+                input_ids=prompt_ids.to(self.draft_device),
+                config=beam_config,
+                flashinfer_wrapper=self.draft_wrapper,
+                prefilled_logits=prefilled_logits,
+                cuda_graph_runner=self.draft_cuda_runner,
+            )
         self.draft_cuda_runner = cuda_runner
 
         # --- Verify: target model scores the tree ---
