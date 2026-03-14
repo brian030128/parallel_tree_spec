@@ -223,22 +223,33 @@ class CudaGraphRunner:
         flashinfer_wrapper: "BeFlashinferWrapper",
         page_size: int,
         dtype: torch.dtype,
+        sparse_batch_position: Optional[KvCacheBatchPosition] = None,
     ):
-        """Copy real data into staging buffers, plan attention, replay graph."""
+        """Copy real data into staging buffers, plan attention, replay graph.
+
+        Args:
+            batch_position: Full (unfiltered) batch position — copied into
+                static buffers so append_kv_cache inside the graph writes to
+                the correct pages.
+            sparse_batch_position: If provided, used for .plan() so attention
+                reads only the sparse subset of pages. When None, attention
+                uses the full batch position.
+        """
         # Copy model inputs
         self.input_ids_buf.copy_(beam_input_ids)
         self.position_ids_buf.copy_(beam_position_ids)
 
-        # Copy batch position fields
+        # Copy FULL batch position into static buffers (used by append_kv_cache inside graph)
         self.batch_position.kv_page_indptr.copy_(batch_position.kv_page_indptr)
         n_idx = batch_position.kv_page_indices.shape[0]
         self.batch_position.kv_page_indices[:n_idx].copy_(batch_position.kv_page_indices)
         self.batch_position.kv_last_page_len.copy_(batch_position.kv_last_page_len)
         self.batch_position.positions.copy_(batch_position.positions)
 
-        # Plan attention (updates FlashInfer's pre-allocated decode buffers)
+        # Plan attention with sparse pages (or full if no sparsity)
+        plan_pos = sparse_batch_position if sparse_batch_position is not None else self.batch_position
         flashinfer_wrapper.prepareAttention(
-            "decode", self.batch_position, page_size, "NONE", dtype,
+            "decode", plan_pos, page_size, "NONE", dtype,
         )
 
         self.graph.replay()
@@ -273,7 +284,8 @@ def beam_search(
             directly. The request_kv_cache must already contain the KV data
             (e.g., copied from the target model's prefill). Shape: [1, seq_len, vocab].
         sparse_strategy: Optional sparse attention strategy for decode steps.
-            When provided, CUDA graphs are disabled (dynamic page counts).
+            Compatible with CUDA graphs: full pages go into static buffers
+            for append, sparse pages are used for .plan() outside the graph.
 
     Returns:
         tree: Draft tree containing all beam search candidates
@@ -328,10 +340,10 @@ def beam_search(
         kv_len += input_len
         org_kv_len = kv_len
 
-    # CUDA graph setup — disabled when sparse strategy is active (dynamic page counts)
+    # CUDA graph setup
     use_sparse = sparse_strategy is not None and sparse_strategy.config.enabled
     cuda_runner = None
-    if config.use_cuda_graph and not use_sparse:
+    if config.use_cuda_graph:
         if cuda_graph_runner is not None and cuda_graph_runner.graph is not None:
             # Reuse existing runner — do NOT reinit decode wrapper (graph holds
             # references to the old wrapper's internal buffers).
@@ -441,10 +453,11 @@ def beam_search(
         beam_position_ids = torch.full((K, 1), current_pos, dtype=torch.long, device=device)
 
         if cuda_runner is not None and cuda_runner.graph is not None:
-            # CUDA graph replay path (only when not using sparse)
             outputs = cuda_runner.replay(
-                beam_input_ids, beam_position_ids, batch_position,
+                beam_input_ids, beam_position_ids,
+                full_batch_position,
                 flashinfer_wrapper, PAGE_SIZE, dtype,
+                sparse_batch_position=batch_position if use_sparse else None,
             )
         else:
             flashinfer_wrapper.prepareAttention(

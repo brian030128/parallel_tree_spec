@@ -22,7 +22,7 @@ def _restrict_visible_gpus():
     """Set CUDA_VISIBLE_DEVICES before any CUDA import to avoid context on unused GPUs."""
     # Parse --device and --draft-device from sys.argv before argparse runs
     gpu_indices = set()
-    for flag in ("--device", "--draft-device"):
+    for flag in ("--device", "--target-device", "--draft-device"):
         if flag in sys.argv:
             idx = sys.argv.index(flag)
             if idx + 1 < len(sys.argv):
@@ -38,7 +38,7 @@ def _restrict_visible_gpus():
     # Remap device args to 0-based indices matching the new CUDA_VISIBLE_DEVICES order
     visible = sorted(gpu_indices)
     remap = {orig: str(i) for i, orig in enumerate(visible)}
-    for flag in ("--device", "--draft-device"):
+    for flag in ("--device", "--target-device", "--draft-device"):
         if flag in sys.argv:
             idx = sys.argv.index(flag)
             if idx + 1 < len(sys.argv):
@@ -99,8 +99,8 @@ def main():
         help="Number of prompts to evaluate (default: 20)"
     )
     parser.add_argument(
-        "--device", type=str, default="cuda",
-        help="Device (default: cuda)"
+        "--target-device", "--device", type=str, default="cuda", dest="target_device",
+        help="Device for target model (default: cuda)"
     )
     parser.add_argument(
         "--page-len", type=int, default=16,
@@ -209,7 +209,8 @@ def main():
     logging.info(f"Beam width: {args.beam_width}, Max depth: {args.max_depth}")
     logging.info(f"Quant configs: {quant_configs}")
     logging.info(f"Prompts: {len(prompts)}")
-    logging.info(f"Draft device: {args.draft_device or args.device}")
+    logging.info(f"Target device: {args.target_device}")
+    logging.info(f"Draft device: {args.draft_device or args.target_device}")
     logging.info(f"Share KV: {args.share_kv}")
     logging.info(f"Temperature: {args.temperature}")
     logging.info(f"CUDA graph: {not args.no_cuda_graph}")
@@ -225,7 +226,7 @@ def main():
         model_name=args.model,
         beam_width=args.beam_width,
         max_depth=args.max_depth,
-        device=args.device,
+        device=args.target_device,
         draft_device=args.draft_device,
         page_len=args.page_len,
         draft_page_len=args.draft_page_len,

@@ -106,7 +106,7 @@ Code is rewritten from these source files:
 - **PillarStrategy**: Top-K pages by importance (kv_norm or qk_score), plus recent window
 - Page filtering only during decode steps; prefill and tree verification use full attention
 - Dual batch positions: sparse for attention `.plan()`, full for `append_kv_cache()`
-- CUDA graphs disabled when sparse is active (dynamic page counts)
+- CUDA graphs compatible: full pages copied into static buffers for append, `.plan()` called with sparse pages outside the graph
 - CLI: `--sparse-method pillar --sparse-budget-ratio 0.05 --sparse-importance kv_norm`
 
 ### Beam Search COW Invariant

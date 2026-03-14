@@ -48,10 +48,10 @@ class QuantConfigResult:
 
     @property
     def mean_draft_time(self) -> float:
-        """Mean total draft time per run."""
+        """Mean total draft time per run (excludes prefill/setup at index 0)."""
         if not self.runs:
             return 0.0
-        return sum(sum(r.draft_step_times) for r in self.runs) / len(self.runs)
+        return sum(sum(r.draft_step_times[1:]) for r in self.runs) / len(self.runs)
 
     @property
     def mean_verify_time(self) -> float:
@@ -68,8 +68,11 @@ class QuantConfigResult:
 
     @property
     def mean_step_time(self) -> float:
-        """Mean per-step draft decode time across all runs and steps."""
-        all_times = [t for r in self.runs for t in r.draft_step_times]
+        """Mean per-step draft decode time across all runs and steps.
+
+        Excludes index 0 (prefill/setup overhead, not a real decode step).
+        """
+        all_times = [t for r in self.runs for t in r.draft_step_times[1:]]
         if not all_times:
             return 0.0
         return sum(all_times) / len(all_times)
@@ -111,9 +114,9 @@ class QuantConfigResult:
         return {
             "n": n,
             "accept": sum(r.accept_len for r in runs) / n,
-            "draft_ms": sum(sum(r.draft_step_times) for r in runs) / n * 1000,
-            "step_ms": sum(t for r in runs for t in r.draft_step_times)
-                       / max(sum(len(r.draft_step_times) for r in runs), 1) * 1000,
+            "draft_ms": sum(sum(r.draft_step_times[1:]) for r in runs) / n * 1000,
+            "step_ms": sum(t for r in runs for t in r.draft_step_times[1:])
+                       / max(sum(len(r.draft_step_times[1:]) for r in runs), 1) * 1000,
             "verify_ms": sum(r.verify_time for r in runs) / n * 1000,
             "target_ms": sum(r.target_decode_time for r in runs) / n * 1000,
         }
@@ -170,10 +173,11 @@ class SweepResults:
             if step_times:
                 lines.append(f"Per-step draft decode time ({label}):")
                 for idx in sorted(step_times.keys()):
+                    if idx == 0:
+                        continue  # skip prefill/setup overhead
                     times = step_times[idx]
                     mean_t = sum(times) / len(times)
-                    step_label = "prefill" if idx == 0 else f"step {idx}"
-                    lines.append(f"  {step_label}: {mean_t * 1000:.2f} ms")
+                    lines.append(f"  step {idx}: {mean_t * 1000:.2f} ms")
                 lines.append("")
 
         # Per-prompt-length breakdown (only when runs have prompt_length > 0)
