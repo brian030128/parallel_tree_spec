@@ -10,7 +10,7 @@ Adapted from subspec_v2/specdecodes/models/draft_models/be_classic_sd_fi.py
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -26,21 +26,11 @@ from .flashinfer.attention_wrapper import BeFlashinferWrapper
 
 
 @dataclass
-class CascadeData:
-    """Per-level tensor lists for MultiLevelCascadeAttentionWrapper.plan()."""
-    qo_indptr_arr: List[torch.Tensor] = field(default_factory=list)
-    kv_page_indptr_arr: List[torch.Tensor] = field(default_factory=list)
-    kv_page_indices_arr: List[torch.Tensor] = field(default_factory=list)
-    kv_last_page_len_arr: List[torch.Tensor] = field(default_factory=list)
-
-
-@dataclass
 class BeamSearchConfig:
     """Configuration for beam search."""
     topk_len: int = 6          # beam width K
     max_depth: int = 10        # number of decode steps
     temperature: float = 1.0   # softmax temperature
-    use_cascade: bool = True   # use cascade attention for shared prompt pages
     use_cuda_graph: bool = False  # capture decode steps in a CUDA graph
 
 
@@ -78,47 +68,6 @@ def _build_beam_batch_position(
         kv_last_page_len=torch.tensor([kv_last_page_len_val] * K, dtype=torch.int32, device=device),
         batch_indices=torch.arange(K, dtype=torch.int32, device=device),
         positions=torch.tensor([current_pos] * K, dtype=torch.int32, device=device),
-    )
-
-
-def _build_cascade_data(
-    beam_pages_list: List[List[int]],
-    num_shared_pages: int,
-    current_pos: int,
-    page_size: int,
-    device: torch.device,
-) -> CascadeData:
-    """
-    Build CascadeData for 2-level cascade attention.
-
-    Level 0 (shared): first num_shared_pages pages (fully filled prompt pages).
-    Level 1 (unique): per-beam pages from index num_shared_pages onward.
-    """
-    K = len(beam_pages_list)
-    i32 = torch.int32
-
-    # Level 0: shared pages
-    shared_pages = beam_pages_list[0][:num_shared_pages]
-    l0_qo_indptr = torch.tensor([0, K], dtype=i32, device=device)
-    l0_kv_page_indptr = torch.tensor([0, num_shared_pages], dtype=i32, device=device)
-    l0_kv_page_indices = torch.tensor(shared_pages, dtype=i32, device=device)
-    l0_kv_last_page_len = torch.tensor([page_size], dtype=i32, device=device)
-
-    # Level 1: per-beam unique pages
-    l1_kv_page_indices = []
-    l1_kv_page_indptr = [0]
-    for pages in beam_pages_list:
-        unique_pages = pages[num_shared_pages:]
-        l1_kv_page_indices.extend(unique_pages)
-        l1_kv_page_indptr.append(len(l1_kv_page_indices))
-
-    kv_last_page_len_val = current_pos % page_size + 1
-
-    return CascadeData(
-        qo_indptr_arr=[l0_qo_indptr, torch.arange(K + 1, dtype=i32, device=device)],
-        kv_page_indptr_arr=[l0_kv_page_indptr, torch.tensor(l1_kv_page_indptr, dtype=i32, device=device)],
-        kv_page_indices_arr=[l0_kv_page_indices, torch.tensor(l1_kv_page_indices, dtype=i32, device=device)],
-        kv_last_page_len_arr=[l0_kv_last_page_len, torch.tensor([kv_last_page_len_val] * K, dtype=i32, device=device)],
     )
 
 
@@ -322,7 +271,7 @@ def beam_search(
         kv_len += input_len
         org_kv_len = kv_len
 
-    # CUDA graph: force plain decode (skip cascade)
+    # CUDA graph setup
     cuda_runner = None
     if config.use_cuda_graph:
         if cuda_graph_runner is not None and cuda_graph_runner.graph is not None:
@@ -335,16 +284,6 @@ def beam_search(
                 cuda_runner = cuda_graph_runner
             else:
                 cuda_runner = CudaGraphRunner(K, kvCachePool.max_pages, device)
-
-    # Cascade: shared prompt pages for level 0
-    num_shared_pages = org_kv_len // PAGE_SIZE
-    use_cascade = config.use_cascade
-    if not use_cascade or cuda_runner is not None:
-        num_shared_pages = 0
-
-    # Init cascade if needed
-    if use_cascade and num_shared_pages > 0 and flashinfer_wrapper.cascade_wrapper is None:
-        flashinfer_wrapper.init_cascade_decode(2)
 
     step_times = [time.perf_counter() - t_prefill_start]
 
@@ -417,32 +356,6 @@ def beam_search(
             outputs = cuda_runner.replay(
                 beam_input_ids, beam_position_ids, batch_position,
                 flashinfer_wrapper, PAGE_SIZE, dtype,
-            )
-        elif num_shared_pages > 0:
-            cascade_data = _build_cascade_data(
-                beam_pages_list, num_shared_pages, current_pos, PAGE_SIZE, device
-            )
-            flashinfer_wrapper.prepareCascadeAttention(
-                cascade_data.qo_indptr_arr,
-                cascade_data.kv_page_indptr_arr,
-                cascade_data.kv_page_indices_arr,
-                cascade_data.kv_last_page_len_arr,
-                PAGE_SIZE,
-                kvCachePool.cache_data[0].dtype,
-            )
-            # Also prepare flat decode for KV append
-            flashinfer_wrapper.prepareAttention(
-                "decode", batch_position, PAGE_SIZE, "NONE", kvCachePool.cache_data[0].dtype,
-            )
-            outputs = model(
-                beam_input_ids,
-                position_ids=beam_position_ids,
-                past_key_values=None,
-                use_cache=False,
-                kvCachePool=kvCachePool,
-                batch_position=batch_position,
-                mode="cascade_decode",
-                flashinferWrapper=flashinfer_wrapper,
             )
         else:
             flashinfer_wrapper.prepareAttention(

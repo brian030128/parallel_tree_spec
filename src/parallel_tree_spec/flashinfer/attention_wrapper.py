@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import flashinfer
@@ -54,7 +54,7 @@ class BeFlashinferWrapper:
     """
     FlashInfer paged attention wrapper.
 
-    Supports prefill, decode, tree (custom mask), and cascade decode modes.
+    Supports prefill, decode, and tree (custom mask) modes.
     """
 
     def __init__(
@@ -63,6 +63,7 @@ class BeFlashinferWrapper:
         num_key_value_heads: int,
         hidden_size: int,
         page_len: int,
+        device: Optional[torch.device] = None,
     ):
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -72,8 +73,9 @@ class BeFlashinferWrapper:
         self.page_len = page_len
 
         self.group_size = self.num_attention_heads // self.num_key_value_heads
+        _device = device if device is not None else torch.cuda.current_device()
         _workspace_buffer = torch.empty(
-            256 * 1024 * 1024, dtype=torch.int8, device=torch.cuda.current_device()
+            256 * 1024 * 1024, dtype=torch.int8, device=_device
         )
         self.prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             float_workspace_buffer=_workspace_buffer, kv_layout="NHD",
@@ -85,7 +87,6 @@ class BeFlashinferWrapper:
             use_tensor_cores=_use_tensor_cores,
         )
         self._decode_output_buf = None
-        self.cascade_wrapper = None
 
     # ------------------------------------------------------------------
     # CUDA graph initialization
@@ -103,65 +104,6 @@ class BeFlashinferWrapper:
             paged_kv_indptr_buffer=torch.zeros(K + 1, dtype=torch.int32, device=device),
             paged_kv_indices_buffer=torch.zeros(max_num_pages, dtype=torch.int32, device=device),
             paged_kv_last_page_len_buffer=torch.zeros(K, dtype=torch.int32, device=device),
-        )
-
-    def init_cascade_decode(self, num_levels: int = 2):
-        """Create a MultiLevelCascadeAttentionWrapper for shared/unique KV split."""
-        _workspace_buffer = torch.empty(
-            256 * 1024 * 1024, dtype=torch.int8, device=torch.cuda.current_device()
-        )
-        self.cascade_wrapper = flashinfer.MultiLevelCascadeAttentionWrapper(
-            num_levels, _workspace_buffer, "NHD"
-        )
-
-    def init_cuda_graph_cascade_decode(
-        self, K: int, max_num_pages: int, page_size: int, device: torch.device
-    ):
-        """Reinitialize cascade_wrapper with use_cuda_graph=True."""
-        _workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
-        i32 = torch.int32
-
-        # Level 0 (shared prompt) staging buffers
-        self.cascade_l0_qo_indptr_buf = torch.tensor([0, K], dtype=i32, device=device)
-        self.cascade_l0_kv_page_indptr_buf = torch.zeros(2, dtype=i32, device=device)
-        self.cascade_l0_kv_page_indices_buf = torch.zeros(max_num_pages, dtype=i32, device=device)
-        self.cascade_l0_kv_last_page_len_buf = torch.tensor([page_size], dtype=i32, device=device)
-
-        # Level 1 (per-beam unique) staging buffers
-        self.cascade_l1_qo_indptr_buf = torch.arange(K + 1, dtype=i32, device=device)
-        self.cascade_l1_kv_page_indptr_buf = torch.zeros(K + 1, dtype=i32, device=device)
-        self.cascade_l1_kv_page_indices_buf = torch.zeros(max_num_pages, dtype=i32, device=device)
-        self.cascade_l1_kv_last_page_len_buf = torch.zeros(K, dtype=i32, device=device)
-
-        self.cascade_wrapper = flashinfer.MultiLevelCascadeAttentionWrapper(
-            2, _workspace_buffer, "NHD",
-            use_cuda_graph=True,
-            qo_indptr_buf_arr=[self.cascade_l0_qo_indptr_buf, self.cascade_l1_qo_indptr_buf],
-            paged_kv_indptr_buf_arr=[self.cascade_l0_kv_page_indptr_buf, self.cascade_l1_kv_page_indptr_buf],
-            paged_kv_indices_buf_arr=[self.cascade_l0_kv_page_indices_buf, self.cascade_l1_kv_page_indices_buf],
-            paged_kv_last_page_len_buf_arr=[self.cascade_l0_kv_last_page_len_buf, self.cascade_l1_kv_last_page_len_buf],
-        )
-
-    def prepareCascadeAttention(
-        self,
-        qo_indptr_arr: List[torch.Tensor],
-        paged_kv_indptr_arr: List[torch.Tensor],
-        paged_kv_indices_arr: List[torch.Tensor],
-        paged_kv_last_page_len_arr: List[torch.Tensor],
-        page_len: int,
-        dtype: torch.dtype,
-    ):
-        """Plan cascade attention (call before each cascade decode step)."""
-        self.cascade_wrapper.plan(
-            qo_indptr_arr=qo_indptr_arr,
-            paged_kv_indptr_arr=paged_kv_indptr_arr,
-            paged_kv_indices_arr=paged_kv_indices_arr,
-            paged_kv_last_page_len=paged_kv_last_page_len_arr,
-            num_qo_heads=self.num_attention_heads,
-            num_kv_heads=self.num_key_value_heads,
-            head_dim=self._head_padded_dim,
-            page_size=page_len,
-            q_data_type=dtype,
         )
 
     # ------------------------------------------------------------------
@@ -289,15 +231,13 @@ class BeFlashinferWrapper:
 
         Args:
             cacheData: single layer's cache [max_pages, 2, page_len, num_heads, head_dim]
-            mode: "prefill", "decode", "cascade_decode", or "tree"
+            mode: "prefill", "decode", or "tree"
         """
         q, k, v = self._pad_qkv(q, k, v)
         if mode in ("prefill", "tree"):
             attn_output = self._batchPrefill(q, k, v, cacheData, batchPosition, rotaryParams)
         elif mode == "decode":
             attn_output = self._batchDecode(q, k, v, cacheData, batchPosition, rotaryParams)
-        elif mode == "cascade_decode":
-            attn_output = self._batchCascadeDecode(q, k, v, cacheData, batchPosition, rotaryParams)
         else:
             raise ValueError(f"Invalid attention mode: {mode}")
         return self._unpad_attention(attn_output)
@@ -315,7 +255,3 @@ class BeFlashinferWrapper:
         out = buf[:q.shape[0]]
         self.decode_wrapper.run(q, cacheData, out=out)
         return out
-
-    def _batchCascadeDecode(self, q, k, v, cacheData, batchPosition, rotaryParams):
-        self.append_kv_cache(q, k, v, batchPosition, cacheData, self.page_len)
-        return self.cascade_wrapper.run(q, cacheData)

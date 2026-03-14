@@ -65,14 +65,6 @@ Key methods:
 2. Runs the FlashInfer attention kernel (prefill or decode)
 3. Returns attention output
 
-### Cascade Attention (Optional Optimization)
-
-For beam search, all beams share the same prompt KV cache. Cascade attention splits computation into:
-- **Level 0 (shared)**: prompt pages, computed once for all K beams
-- **Level 1 (unique)**: per-beam decode pages
-
-Uses `flashinfer.MultiLevelCascadeAttentionWrapper` with 2 levels.
-
 ## Beam Search with Paged KV Cache
 
 ### Phase 1: Prefill

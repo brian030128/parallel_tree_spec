@@ -39,6 +39,7 @@ class BeamSearchExperiment:
         beam_width: int = 6,
         max_depth: int = 10,
         device: str = "cuda",
+        draft_device: Optional[str] = None,
         dtype: torch.dtype = torch.bfloat16,
         page_len: int = 16,
         max_pages: int = 4096,
@@ -51,6 +52,11 @@ class BeamSearchExperiment:
         self.beam_width = beam_width
         self.max_depth = max_depth
         self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", 0)
+        self.draft_device = torch.device(draft_device) if draft_device else self.device
+        if self.draft_device.type == "cuda" and self.draft_device.index is None:
+            self.draft_device = torch.device("cuda", 0)
         self.dtype = dtype
         self.page_len = page_len
         self.max_pages = max_pages
@@ -81,12 +87,11 @@ class BeamSearchExperiment:
         """Load full-precision target model with FlashInfer patches."""
         self.load_tokenizer()
 
-        logger.info(f"Loading target model: {self.model_name} ({self.dtype})")
+        logger.info(f"Loading target model: {self.model_name} ({self.dtype}) on {self.device}")
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=self.dtype,
-            device_map=self.device,
-        )
+        ).to(self.device)
         model.eval()
         apply_flashinfer_kernel_to_llama(model)
 
@@ -110,6 +115,7 @@ class BeamSearchExperiment:
             num_key_value_heads=num_kv_heads,
             hidden_size=config.hidden_size,
             page_len=self.page_len,
+            device=self.device,
         )
 
         self.target_model = model
@@ -124,11 +130,10 @@ class BeamSearchExperiment:
         """
         self.load_tokenizer()
 
-        logger.info(f"Loading draft model: {self.model_name} (HQQ {nbits}b/g{group_size})")
+        logger.info(f"Loading draft model: {self.model_name} (HQQ {nbits}b/g{group_size}) on {self.draft_device}")
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=torch.bfloat16,
-            device_map=self.device,
         )
         model.eval()
 
@@ -137,7 +142,7 @@ class BeamSearchExperiment:
 
         # Quantize
         quant_config = make_quant_config(model, nbits=nbits, group_size=group_size)
-        quantize_model(model, quant_config, compute_dtype=torch.float16, device=str(self.device))
+        quantize_model(model, quant_config, compute_dtype=torch.float16, device=str(self.draft_device))
 
         config = model.config
         num_layers = config.num_hidden_layers
@@ -151,7 +156,7 @@ class BeamSearchExperiment:
             head_dim=head_dim,
             page_len=self.page_len,
             dtype=torch.float16,
-            device=self.device,
+            device=self.draft_device,
         )
 
         self.draft_wrapper = BeFlashinferWrapper(
@@ -159,6 +164,7 @@ class BeamSearchExperiment:
             num_key_value_heads=num_kv_heads,
             hidden_size=config.hidden_size,
             page_len=self.page_len,
+            device=self.draft_device,
         )
 
         self.draft_model = model
@@ -168,12 +174,11 @@ class BeamSearchExperiment:
         """Load unquantized bf16 draft model (same as target, for baseline)."""
         self.load_tokenizer()
 
-        logger.info(f"Loading draft model (unquantized bf16): {self.model_name}")
+        logger.info(f"Loading draft model (unquantized bf16): {self.model_name} on {self.draft_device}")
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=torch.bfloat16,
-            device_map=self.device,
-        )
+        ).to(self.draft_device)
         model.eval()
         apply_flashinfer_kernel_to_llama(model)
 
@@ -189,7 +194,7 @@ class BeamSearchExperiment:
             head_dim=head_dim,
             page_len=self.page_len,
             dtype=torch.bfloat16,
-            device=self.device,
+            device=self.draft_device,
         )
 
         self.draft_wrapper = BeFlashinferWrapper(
@@ -197,6 +202,7 @@ class BeamSearchExperiment:
             num_key_value_heads=num_kv_heads,
             hidden_size=config.hidden_size,
             page_len=self.page_len,
+            device=self.draft_device,
         )
 
         self.draft_model = model
@@ -317,7 +323,6 @@ class BeamSearchExperiment:
             topk_len=self.beam_width,
             max_depth=self.max_depth,
             temperature=self.temperature,
-            use_cascade=True,
             use_cuda_graph=self.use_cuda_graph,
         )
 
@@ -330,12 +335,12 @@ class BeamSearchExperiment:
                 dst_pool=self.draft_kv_pool,
             )
             # Use target's prefill logits so draft skips its own prefill
-            prefilled_logits = target_outputs.logits
+            prefilled_logits = target_outputs.logits.to(self.draft_device)
 
         tree, step_times, cuda_runner = beam_search(
             model=self.draft_model,
             request_kv_cache=draft_kv_cache,
-            input_ids=prompt_ids,
+            input_ids=prompt_ids.to(self.draft_device),
             config=beam_config,
             flashinfer_wrapper=self.draft_wrapper,
             prefilled_logits=prefilled_logits,
@@ -414,7 +419,7 @@ class BeamSearchExperiment:
 
             # Warm-up: run draft+verify cycles to JIT-compile CUDA kernels
             if self.warmup_iters > 0:
-                warmup_ids = self.tokenizer.encode(prompts[0], return_tensors="pt").to(self.device)
+                warmup_ids = self.tokenizer.encode(prompts[0], return_tensors="pt").to(self.device)  # noqa: target device; run_single handles .to(draft_device)
                 for wi in range(self.warmup_iters):
                     logger.info(f"  Warm-up {wi+1}/{self.warmup_iters}...")
                     self.run_single(warmup_ids)

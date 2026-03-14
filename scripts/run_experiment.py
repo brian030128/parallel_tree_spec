@@ -13,8 +13,44 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 from typing import List, Tuple
+
+
+def _restrict_visible_gpus():
+    """Set CUDA_VISIBLE_DEVICES before any CUDA import to avoid context on unused GPUs."""
+    # Parse --device and --draft-device from sys.argv before argparse runs
+    gpu_indices = set()
+    for flag in ("--device", "--draft-device"):
+        if flag in sys.argv:
+            idx = sys.argv.index(flag)
+            if idx + 1 < len(sys.argv):
+                val = sys.argv[idx + 1]
+                if val.startswith("cuda:"):
+                    gpu_indices.add(val.split(":")[1])
+                elif val == "cuda":
+                    gpu_indices.add("0")
+    if not gpu_indices:
+        gpu_indices.add("0")  # default --device is cuda -> cuda:0
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(gpu_indices))
+
+    # Remap device args to 0-based indices matching the new CUDA_VISIBLE_DEVICES order
+    visible = sorted(gpu_indices)
+    remap = {orig: str(i) for i, orig in enumerate(visible)}
+    for flag in ("--device", "--draft-device"):
+        if flag in sys.argv:
+            idx = sys.argv.index(flag)
+            if idx + 1 < len(sys.argv):
+                val = sys.argv[idx + 1]
+                if val.startswith("cuda:"):
+                    orig_idx = val.split(":")[1]
+                    sys.argv[idx + 1] = f"cuda:{remap[orig_idx]}"
+                elif val == "cuda":
+                    sys.argv[idx + 1] = "cuda:0"
+
+
+_restrict_visible_gpus()
 
 from parallel_tree_spec.experiment import (
     BeamSearchExperiment,
@@ -73,6 +109,10 @@ def main():
     parser.add_argument(
         "--max-pages", type=int, default=4096,
         help="Maximum number of KV cache pages (default: 4096)"
+    )
+    parser.add_argument(
+        "--draft-device", type=str, default=None,
+        help="Device for draft model (default: same as --device)"
     )
     parser.add_argument(
         "--share-kv", action="store_true",
@@ -140,6 +180,7 @@ def main():
     logging.info(f"Beam width: {args.beam_width}, Max depth: {args.max_depth}")
     logging.info(f"Quant configs: {quant_configs}")
     logging.info(f"Prompts: {len(prompts)}")
+    logging.info(f"Draft device: {args.draft_device or args.device}")
     logging.info(f"Share KV: {args.share_kv}")
     logging.info(f"Temperature: {args.temperature}")
     logging.info(f"CUDA graph: {not args.no_cuda_graph}")
@@ -150,6 +191,7 @@ def main():
         beam_width=args.beam_width,
         max_depth=args.max_depth,
         device=args.device,
+        draft_device=args.draft_device,
         page_len=args.page_len,
         max_pages=args.max_pages,
         share_kv=args.share_kv,

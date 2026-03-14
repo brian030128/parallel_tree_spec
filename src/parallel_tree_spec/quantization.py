@@ -76,9 +76,15 @@ def quantize_model(
     )
     HQQLinear.set_backend(HQQBackend.PYTORCH)
 
-    try:
-        prepare_for_inference(model, backend="gemlite")
-        model.eval()  # GemLite layers default to training=True after patching
-        logging.info("HQQ model patched with GemLite backend")
-    except Exception as e:
-        logging.warning(f"GemLite patching failed, using PyTorch backend: {e}")
+    # Triton kernels (used by GemLite) launch on the current CUDA device.
+    # We must set the device context so Triton can access tensors on `device`.
+    cuda_device = torch.device(device)
+    with torch.cuda.device(cuda_device):
+        try:
+            prepare_for_inference(model, backend="gemlite")
+            model.eval()
+            logging.info("HQQ model patched with GemLite backend")
+        except Exception as e:
+            logging.warning(f"GemLite patching failed, falling back to PyTorch backend: {e}")
+            prepare_for_inference(model, backend="default")
+            model.eval()

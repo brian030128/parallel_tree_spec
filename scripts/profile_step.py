@@ -7,7 +7,7 @@ logging.basicConfig(level=logging.INFO)
 
 from parallel_tree_spec.experiment import BeamSearchExperiment, DEFAULT_PROMPTS
 from parallel_tree_spec.beam_search import (
-    _build_beam_batch_position, _build_cascade_data, _copy_block,
+    _build_beam_batch_position, _copy_block,
     BeamSearchConfig,
 )
 from parallel_tree_spec.flashinfer.cache_manager import (
@@ -36,12 +36,6 @@ def profiled_beam_search(
     logits = prefilled_logits
     org_kv_len = kv_len
 
-    num_shared_pages = org_kv_len // PAGE_SIZE
-    use_cascade = config.use_cascade
-
-    if use_cascade and num_shared_pages > 0 and flashinfer_wrapper.cascade_wrapper is None:
-        flashinfer_wrapper.init_cascade_decode(2)
-
     # Init tree + beams
     tree = Tree(input_ids[0, -1], dtype)
     prompt_pages = list(request_kv_cache.kv_page_indices)
@@ -68,8 +62,8 @@ def profiled_beam_search(
     cum_log_probs = torch.log(topk_probs).tolist()
 
     timings = {
-        "cow": [], "build_batch": [], "build_cascade": [],
-        "prepare_cascade": [], "prepare_decode": [],
+        "cow": [], "build_batch": [],
+        "prepare_decode": [],
         "forward": [], "scoring": [], "tree_update": [],
         "total": [],
     }
@@ -114,57 +108,22 @@ def profiled_beam_search(
         beam_position_ids = torch.full((K, 1), current_pos, dtype=torch.long, device=device)
 
         # --- Attention prep + forward ---
-        if num_shared_pages > 0:
-            t0 = time.perf_counter()
-            cascade_data = _build_cascade_data(
-                beam_pages_list, num_shared_pages, current_pos, PAGE_SIZE, device
-            )
-            timings["build_cascade"].append(time.perf_counter() - t0)
+        t0 = time.perf_counter()
+        flashinfer_wrapper.prepareAttention(
+            "decode", batch_position, PAGE_SIZE, "NONE", kvCachePool.cache_data[0].dtype,
+        )
+        timings["prepare_decode"].append(time.perf_counter() - t0)
 
-            t0 = time.perf_counter()
-            flashinfer_wrapper.prepareCascadeAttention(
-                cascade_data.qo_indptr_arr,
-                cascade_data.kv_page_indptr_arr,
-                cascade_data.kv_page_indices_arr,
-                cascade_data.kv_last_page_len_arr,
-                PAGE_SIZE,
-                kvCachePool.cache_data[0].dtype,
-            )
-            timings["prepare_cascade"].append(time.perf_counter() - t0)
-
-            t0 = time.perf_counter()
-            flashinfer_wrapper.prepareAttention(
-                "decode", batch_position, PAGE_SIZE, "NONE", kvCachePool.cache_data[0].dtype,
-            )
-            timings["prepare_decode"].append(time.perf_counter() - t0)
-
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            outputs = model(
-                beam_input_ids, position_ids=beam_position_ids,
-                past_key_values=None, use_cache=False,
-                kvCachePool=kvCachePool, batch_position=batch_position,
-                mode="cascade_decode", flashinferWrapper=flashinfer_wrapper,
-            )
-            torch.cuda.synchronize()
-            timings["forward"].append(time.perf_counter() - t0)
-        else:
-            t0 = time.perf_counter()
-            flashinfer_wrapper.prepareAttention(
-                "decode", batch_position, PAGE_SIZE, "NONE", kvCachePool.cache_data[0].dtype,
-            )
-            timings["prepare_decode"].append(time.perf_counter() - t0)
-
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            outputs = model(
-                beam_input_ids, position_ids=beam_position_ids,
-                past_key_values=None, use_cache=False,
-                kvCachePool=kvCachePool, batch_position=batch_position,
-                mode="decode", flashinferWrapper=flashinfer_wrapper,
-            )
-            torch.cuda.synchronize()
-            timings["forward"].append(time.perf_counter() - t0)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outputs = model(
+            beam_input_ids, position_ids=beam_position_ids,
+            past_key_values=None, use_cache=False,
+            kvCachePool=kvCachePool, batch_position=batch_position,
+            mode="decode", flashinferWrapper=flashinfer_wrapper,
+        )
+        torch.cuda.synchronize()
+        timings["forward"].append(time.perf_counter() - t0)
 
         logits_out = outputs.logits
 
@@ -291,10 +250,8 @@ def main():
             dst_pool=exp.draft_kv_pool,
         )
         config = BeamSearchConfig(
-            topk_len=K, max_depth=10, temperature=0.2, use_cascade=True,
+            topk_len=K, max_depth=10, temperature=0.2,
         )
-        # Reset cascade wrapper so it re-inits
-        exp.draft_wrapper.cascade_wrapper = None
         return profiled_beam_search(
             exp.draft_model, draft_kv_cache, prompt_ids, config,
             exp.draft_wrapper, prefilled_logits=target_outputs.logits,
