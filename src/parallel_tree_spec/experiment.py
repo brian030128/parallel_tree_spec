@@ -48,6 +48,7 @@ class BeamSearchExperiment:
         temperature: float = 1.0,
         use_cuda_graph: bool = False,
         warmup_iters: int = 1,
+        verification_method: str = "traversal",
     ):
         self.model_name = model_name
         self.beam_width = beam_width
@@ -68,6 +69,7 @@ class BeamSearchExperiment:
         self.temperature = temperature
         self.use_cuda_graph = use_cuda_graph
         self.warmup_iters = warmup_iters
+        self.verification_method = verification_method
 
         self.tokenizer = None
         self.target_model = None
@@ -374,6 +376,8 @@ class BeamSearchExperiment:
             position_offset=prompt_ids.shape[1] - 1,
             device=self.device,
             eos_token_id=eos_token_id,
+            verification_method=self.verification_method,
+            temperature=self.temperature,
         )
 
         # Collect per-depth acceptance info

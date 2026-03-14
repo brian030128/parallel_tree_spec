@@ -1,11 +1,13 @@
 """
 Tree verification for speculative decoding.
 
-Implements exact verification (greedy argmax matching) of draft trees
-against target model logits, plus the target model tree decoding forward pass.
+Implements exact verification (greedy argmax matching) and traversal
+verification (Weng et al., arXiv:2505.12398) of draft trees against
+target model logits, plus the target model tree decoding forward pass.
 
 Adapted from:
   - subspec_v2/specdecodes/models/utils/tree_verify.py (exact method)
+  - subspec_v2/specdecodes/models/utils/traversal_verification.py (traversal method)
   - subspec_v2/specdecodes/models/generators/classic_sd_fi.py (_tree_decoding)
   - subspec_v2/specdecodes/models/generators/classic_sd.py (_verify_step, _sample_token)
 """
@@ -267,6 +269,262 @@ def verify_tree_exact(
 
 
 # ---------------------------------------------------------------------------
+# Traversal verification (Weng et al., arXiv:2505.12398)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def verify_tree_traversal(
+    tree: Tree,
+    logits: torch.Tensor,
+    root_ind: int = 0,
+    eos_token_id: Optional[int] = None,
+    skip_nodes: int = 0,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Traversal verification: stochastic acceptance with residual resampling.
+
+    Uses sequence-level acceptance with bottom-up leaf-first traversal and
+    residual distribution updates.  Achieves higher acceptance rates than
+    exact (greedy argmax) verification.
+
+    Args:
+        tree: Draft tree
+        logits: [1, N, vocab_size] target model logits for tree nodes
+        root_ind: Root node index
+        eos_token_id: EOS token ID (stop if accepted)
+        skip_nodes: Number of leading nodes skipped
+        do_sample: If True, sample bonus token via multinomial; else argmax
+
+    Returns:
+        sampled_tokens: [1, L] accepted tokens + bonus
+        hidden_indices: [L] tree node indices (for KV cache reorder)
+        total_len: total tokens in output (accept_len + bonus)
+        accept_len: accepted tokens (excludes bonus)
+    """
+    eps = 1e-8
+    dtype = torch.float32
+
+    # ── 1. Flatten tree to tensors ──────────────────────────────────────────
+    # Apply same temperature as draft model so M_b and M_s are comparable
+    scaled_logits = logits / temperature if temperature != 1.0 else logits
+    global_p = _sample_probs(scaled_logits).squeeze(0).cpu()  # [N, vocab_size]
+
+    relevant_nodes = tree.nodes[skip_nodes:]
+    num_nodes = len(relevant_nodes)
+    tree_idx_map = {i + skip_nodes: i for i in range(num_nodes)}
+
+    t_token_ids = torch.empty(num_nodes, dtype=torch.long)
+    t_parent_indices = torch.full((num_nodes,), -1, dtype=torch.long)
+    t_depths = torch.zeros(num_nodes, dtype=torch.long)
+    t_cum_probs = torch.zeros(num_nodes, dtype=dtype)
+    local_adj: List[List[int]] = [[] for _ in range(num_nodes)]
+    stack = [(root_ind, 0)]
+
+    while stack:
+        orig_idx, depth = stack.pop()
+        if orig_idx < skip_nodes:
+            continue
+        local_idx = tree_idx_map[orig_idx]
+        node = tree.nodes[orig_idx]
+
+        t_token_ids[local_idx] = node.token_id
+        t_cum_probs[local_idx] = node.cumulative_probability
+        t_depths[local_idx] = depth
+        if node.parent is not None and node.parent >= skip_nodes:
+            parent_local = tree_idx_map[node.parent]
+            t_parent_indices[local_idx] = parent_local
+            local_adj[parent_local].append(local_idx)
+
+        for child_idx in reversed(node.children):
+            stack.append((child_idx, depth + 1))
+
+    # ── 2. Compute M_b, M_s, p_alpha ───────────────────────────────────────
+    t_Mb_scalars = torch.zeros(num_nodes, dtype=dtype)
+    t_Mb_scalars[0] = 1.0
+
+    non_roots = t_parent_indices != -1
+    parents_of_non_roots = t_parent_indices[non_roots]
+    tokens_of_non_roots = t_token_ids[non_roots]
+    t_Mb_scalars[non_roots] = global_p[parents_of_non_roots, tokens_of_non_roots].to(dtype)
+
+    t_Ms_scalars = torch.zeros(num_nodes, dtype=dtype)
+    t_Ms_scalars[0] = 1.0
+    t_Ms_scalars[non_roots] = t_cum_probs[non_roots]
+
+    t_p_alpha = torch.zeros(num_nodes, dtype=dtype)
+    t_p_alpha[0] = 1.0
+
+    max_depth = int(t_depths.max().item())
+    for d in range(1, max_depth + 1):
+        mask = t_depths == d
+        if not mask.any():
+            continue
+        node_indices = torch.nonzero(mask).squeeze(-1)
+        parents = t_parent_indices[node_indices]
+        p_parents = t_p_alpha[parents]
+        mb = t_Mb_scalars[node_indices]
+        ms = t_Ms_scalars[node_indices]
+        ratio = torch.zeros_like(mb)
+        valid_ms = ms > eps
+        ratio[valid_ms] = mb[valid_ms] / ms[valid_ms]
+        t_p_alpha[node_indices] = torch.minimum(p_parents * ratio, torch.tensor(1.0))
+
+    # ── 3. Traversal loop ──────────────────────────────────────────────────
+    valid_mask = torch.ones(num_nodes, dtype=torch.bool)
+    accepted_node_idx = 0
+
+    while True:
+        # Walk from root to first leaf (first valid child at each level)
+        curr = 0
+        while True:
+            first_child = None
+            for c in local_adj[curr]:
+                if valid_mask[c]:
+                    first_child = c
+                    break
+            if first_child is None:
+                break
+            curr = first_child
+        candidate_idx = curr
+
+        if not valid_mask[candidate_idx]:
+            break
+
+        # Stochastic accept/reject
+        p_val = t_p_alpha[candidate_idx].item()
+        eta = torch.rand(1).item()
+
+        if eta < p_val:
+            accepted_node_idx = candidate_idx
+            break
+
+        # Reject: mark deleted, update siblings
+        valid_mask[candidate_idx] = False
+        old_ms_rejected = t_Ms_scalars[candidate_idx].item()
+        t_Ms_scalars[candidate_idx] = 0.0
+        parent_idx = t_parent_indices[candidate_idx].item()
+
+        if parent_idx == -1:
+            accepted_node_idx = 0
+            break
+
+        siblings = torch.tensor(local_adj[parent_idx], dtype=torch.long)
+        if len(siblings) == 0:
+            continue
+
+        active_sibling_mask = valid_mask[siblings]
+        if not active_sibling_mask.any():
+            continue
+        active_siblings = siblings[active_sibling_mask]
+
+        ms_rejected = old_ms_rejected
+        p_old = t_p_alpha[parent_idx].item()
+
+        ms_denom = 1.0 - ms_rejected
+        if ms_denom < eps:
+            ms_denom = eps
+
+        # Compute S (total residual mass)
+        all_child_indices = torch.tensor(local_adj[parent_idx], dtype=torch.long)
+        mbs = t_Mb_scalars[all_child_indices]
+        mss = t_Ms_scalars[all_child_indices]
+        S_tree = torch.clamp(p_old * mbs - mss, min=0).sum().item()
+        S_outside = p_old * (1.0 - mbs.sum().item())
+        S = S_tree + S_outside
+        if S < eps:
+            S = eps
+
+        # Update p_alpha for parent
+        p_new = S / (S + 1.0 - p_old)
+        t_p_alpha[parent_idx] = p_new
+
+        # Update Ms and Mb for active siblings
+        sib_mbs = t_Mb_scalars[active_siblings]
+        sib_mss = t_Ms_scalars[active_siblings]
+        new_ms_sibs = sib_mss / ms_denom
+        new_mb_sibs = torch.clamp(p_old * sib_mbs - sib_mss, min=0) / S
+        t_Ms_scalars[active_siblings] = new_ms_sibs
+        t_Mb_scalars[active_siblings] = new_mb_sibs
+
+        # Update rejected node's Mb to its residual value
+        old_mb_rejected = t_Mb_scalars[candidate_idx].item()
+        t_Mb_scalars[candidate_idx] = max(p_old * old_mb_rejected - old_ms_rejected, 0.0) / S
+
+        # Update p_alpha for active siblings
+        ratio_sibs = torch.zeros_like(new_mb_sibs)
+        valid_ms_sibs = new_ms_sibs > eps
+        ratio_sibs[valid_ms_sibs] = new_mb_sibs[valid_ms_sibs] / new_ms_sibs[valid_ms_sibs]
+        t_p_alpha[active_siblings] = torch.minimum(p_new * ratio_sibs, torch.tensor(1.0))
+
+        # Propagate p_alpha updates to descendants
+        update_queue = active_siblings.tolist()
+        while update_queue:
+            u = update_queue.pop(0)
+            p_u = t_p_alpha[u].item()
+            u_children = local_adj[u]
+            if not u_children:
+                continue
+            u_children_t = torch.tensor(u_children, dtype=torch.long)
+            valid_children = u_children_t[valid_mask[u_children_t]]
+            if len(valid_children) > 0:
+                c_mb = t_Mb_scalars[valid_children]
+                c_ms = t_Ms_scalars[valid_children]
+                c_ratio = torch.zeros_like(c_mb)
+                c_valid_ms = c_ms > eps
+                c_ratio[c_valid_ms] = c_mb[c_valid_ms] / c_ms[c_valid_ms]
+                t_p_alpha[valid_children] = torch.minimum(p_u * c_ratio, torch.tensor(1.0))
+                update_queue.extend(valid_children.tolist())
+
+    # ── 4. Reconstruct output ──────────────────────────────────────────────
+    path_indices = []
+    curr = accepted_node_idx
+    while curr != -1:
+        path_indices.append(curr)
+        curr = t_parent_indices[curr].item()
+    path_indices.reverse()
+
+    sampled_tokens_list = []
+    hidden_indices_list = []
+
+    for i in range(1, len(path_indices)):
+        local_idx = path_indices[i]
+        token = t_token_ids[local_idx].item()
+        orig_idx = local_idx + skip_nodes
+        sampled_tokens_list.append(token)
+        hidden_indices_list.append(orig_idx)
+        if eos_token_id is not None and token == eos_token_id:
+            break
+
+    # Bonus token
+    should_sample_bonus = True
+    if sampled_tokens_list and eos_token_id is not None and sampled_tokens_list[-1] == eos_token_id:
+        should_sample_bonus = False
+
+    if should_sample_bonus:
+        leaf_local_idx = accepted_node_idx
+        if leaf_local_idx < global_p.shape[0]:
+            dist = global_p[leaf_local_idx]
+            if do_sample:
+                bonus_token = torch.multinomial(dist, 1).item()
+            else:
+                bonus_token = torch.argmax(dist).item()
+        else:
+            bonus_token = 0
+        sampled_tokens_list.append(bonus_token)
+        hidden_indices_list.append(leaf_local_idx + skip_nodes)
+
+    device = logits.device
+    ret_tokens = torch.tensor([sampled_tokens_list], dtype=torch.long, device=device)
+    ret_indices = torch.tensor(hidden_indices_list, dtype=torch.long, device=device)
+
+    total_len = len(sampled_tokens_list)
+    accept_len = max(0, total_len - 1)
+
+    return ret_tokens, ret_indices, total_len, accept_len
+
+
+# ---------------------------------------------------------------------------
 # Combined: target decode + verify
 # ---------------------------------------------------------------------------
 
@@ -279,8 +537,10 @@ def verify_draft_tree(
     position_offset: int,
     device: torch.device,
     eos_token_id: Optional[int] = None,
+    verification_method: str = "traversal",
+    temperature: float = 1.0,
 ) -> VerifyResult:
-    """Run full verification: target model tree decode + exact verify.
+    """Run full verification: target model tree decode + verify.
 
     Args:
         target_model: Full-precision target model
@@ -290,6 +550,8 @@ def verify_draft_tree(
         position_offset: Position of tree root in full sequence
         device: Device
         eos_token_id: EOS token ID
+        verification_method: "traversal" (stochastic, higher acceptance) or
+                             "exact" (greedy argmax matching)
 
     Returns:
         VerifyResult with accepted tokens, indices, counts, and timing
@@ -302,10 +564,18 @@ def verify_draft_tree(
         request_kv_cache, position_offset, device,
     )
 
-    # Exact verification
-    sampled_tokens, hidden_indices, total_len, accept_len = verify_tree_exact(
-        tree, logits, root_ind=0, eos_token_id=eos_token_id,
-    )
+    # Dispatch verification method
+    if verification_method == "traversal":
+        sampled_tokens, hidden_indices, total_len, accept_len = verify_tree_traversal(
+            tree, logits, root_ind=0, eos_token_id=eos_token_id,
+            temperature=temperature,
+        )
+    elif verification_method == "exact":
+        sampled_tokens, hidden_indices, total_len, accept_len = verify_tree_exact(
+            tree, logits, root_ind=0, eos_token_id=eos_token_id,
+        )
+    else:
+        raise ValueError(f"Unknown verification method: {verification_method!r} (expected 'traversal' or 'exact')")
 
     t_end = time.perf_counter()
 

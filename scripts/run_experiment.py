@@ -148,6 +148,11 @@ def main():
         help="URL to download source text for --prompt-lengths (default: War and Peace from Gutenberg)"
     )
     parser.add_argument(
+        "--verification-method", type=str, default="traversal",
+        choices=["traversal", "exact"],
+        help="Verification method: 'traversal' (stochastic, higher acceptance) or 'exact' (greedy argmax) (default: traversal)"
+    )
+    parser.add_argument(
         "--output", type=str, default=None,
         help="Output file for results (default: stdout)"
     )
@@ -190,6 +195,7 @@ def main():
     logging.info(f"Share KV: {args.share_kv}")
     logging.info(f"Temperature: {args.temperature}")
     logging.info(f"CUDA graph: {not args.no_cuda_graph}")
+    logging.info(f"Verification: {args.verification_method}")
     logging.info(f"Warm-up iters: {args.warmup_iters}")
 
     experiment = BeamSearchExperiment(
@@ -205,6 +211,7 @@ def main():
         temperature=args.temperature,
         use_cuda_graph=not args.no_cuda_graph,
         warmup_iters=args.warmup_iters,
+        verification_method=args.verification_method,
     )
 
     results = experiment.run_sweep(prompts, quant_configs)
