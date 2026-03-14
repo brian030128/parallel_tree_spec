@@ -23,6 +23,60 @@ from .flashinfer.cache_manager import (
     getKvCacheBatchPosition,
 )
 from .flashinfer.attention_wrapper import BeFlashinferWrapper
+from .sparse_attention.base import SparseAttentionStrategy
+
+
+def _extract_last_token_q(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    kv_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Extract average Q vectors (across layers) for the last prompt token.
+
+    Runs the last token through embedding + all layers' q_proj + RoPE,
+    without doing attention or writing to cache. Returns averaged Q
+    across all layers as [num_q_heads, head_dim].
+    """
+    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+    last_token = input_ids[:, -1:]  # [1, 1]
+    # Get hidden state from embedding
+    hidden = model.model.embed_tokens(last_token)  # [1, 1, hidden_size]
+
+    # Position for RoPE
+    position_ids = torch.tensor([[kv_len - 1]], dtype=torch.long, device=device)
+
+    # Get position embeddings (cos, sin) from the rotary embedding module
+    position_embeddings = model.model.rotary_emb(hidden, position_ids)
+
+    # Collect Q from each layer's q_proj + RoPE
+    q_accum = None
+    num_layers = 0
+    for layer in model.model.layers:
+        attn = layer.self_attn
+        head_dim = attn.head_dim
+
+        # q_proj on the hidden state (ignores layer norm for simplicity —
+        # the exact hidden state doesn't matter much, we just need a
+        # representative Q direction for importance scoring)
+        q = attn.q_proj(hidden)  # [1, 1, num_heads * head_dim]
+        num_heads = q.shape[-1] // head_dim
+        q = q.view(1, 1, num_heads, head_dim).transpose(1, 2)  # [1, heads, 1, dim]
+
+        # Apply RoPE
+        cos, sin = position_embeddings
+        q, _ = apply_rotary_pos_emb(q, q, cos, sin)  # only need q
+
+        q = q.squeeze(2).squeeze(0)  # [num_heads, head_dim]
+
+        if q_accum is None:
+            q_accum = q.float()
+        else:
+            q_accum += q.float()
+        num_layers += 1
+
+    return q_accum / num_layers  # [num_q_heads, head_dim]
 
 
 @dataclass
@@ -204,6 +258,7 @@ def beam_search(
     flashinfer_wrapper: BeFlashinferWrapper,
     prefilled_logits: Optional[torch.Tensor] = None,
     cuda_graph_runner: Optional["CudaGraphRunner"] = None,
+    sparse_strategy: Optional[SparseAttentionStrategy] = None,
 ) -> Tuple[Tree, List[float], Optional["CudaGraphRunner"]]:
     """
     Run beam search on the draft model using FlashInfer paged attention.
@@ -217,6 +272,8 @@ def beam_search(
         prefilled_logits: If provided, skip draft prefill and use these logits
             directly. The request_kv_cache must already contain the KV data
             (e.g., copied from the target model's prefill). Shape: [1, seq_len, vocab].
+        sparse_strategy: Optional sparse attention strategy for decode steps.
+            When provided, CUDA graphs are disabled (dynamic page counts).
 
     Returns:
         tree: Draft tree containing all beam search candidates
@@ -271,9 +328,10 @@ def beam_search(
         kv_len += input_len
         org_kv_len = kv_len
 
-    # CUDA graph setup
+    # CUDA graph setup — disabled when sparse strategy is active (dynamic page counts)
+    use_sparse = sparse_strategy is not None and sparse_strategy.config.enabled
     cuda_runner = None
-    if config.use_cuda_graph:
+    if config.use_cuda_graph and not use_sparse:
         if cuda_graph_runner is not None and cuda_graph_runner.graph is not None:
             # Reuse existing runner — do NOT reinit decode wrapper (graph holds
             # references to the old wrapper's internal buffers).
@@ -290,6 +348,23 @@ def beam_search(
     # --- Init tree ---
     tree = Tree(input_ids[0, -1], dtype)
     prompt_pages = list(request_kv_cache.kv_page_indices)
+
+    # --- Compute importance for sparse attention ---
+    if use_sparse:
+        sparse_strategy.reset()
+        # Extract Q vectors for qk_score method
+        q_vectors = None
+        if sparse_strategy.config.importance_method == "qk_score":
+            q_vectors = _extract_last_token_q(model, input_ids, kv_len, device)
+        sparse_strategy.update_importance(
+            kv_cache=kvCachePool.cache_data,
+            page_indices=prompt_pages,
+            seq_len=kv_len,
+            page_len=PAGE_SIZE,
+            num_kv_heads=kvCachePool.num_heads,
+            head_dim=kvCachePool.head_dims,
+            q=q_vectors,
+        )
 
     # --- Get K initial tokens from prefill output ---
     sampled_probs = torch.softmax(logits[0, -1, :] / config.temperature, dim=-1)
@@ -340,9 +415,23 @@ def beam_search(
                     node_pages[node_idx][pli] = new_page
                     page_ref_counts[new_page] = 1
 
-        # Build batch position for K beams
+        # Build FULL batch position for K beams (used for KV append)
         beam_pages_list = [node_pages[beam_node[k]] for k in range(K)]
-        batch_position = _build_beam_batch_position(beam_pages_list, current_pos, PAGE_SIZE, device)
+        full_batch_position = _build_beam_batch_position(beam_pages_list, current_pos, PAGE_SIZE, device)
+
+        # Build SPARSE batch position for attention (if sparse strategy active)
+        append_batch_position = None
+        if use_sparse:
+            sparse_pages_list = [
+                sparse_strategy.filter_pages(pages, seq_len=current_pos, page_len=PAGE_SIZE)
+                for pages in beam_pages_list
+            ]
+            sparse_batch_position = _build_beam_batch_position(sparse_pages_list, current_pos, PAGE_SIZE, device)
+            # Attention uses sparse pages; KV append uses full pages
+            batch_position = sparse_batch_position
+            append_batch_position = full_batch_position
+        else:
+            batch_position = full_batch_position
 
         # Batched decode forward: [K, 1]
         beam_input_ids = torch.tensor(
@@ -352,7 +441,7 @@ def beam_search(
         beam_position_ids = torch.full((K, 1), current_pos, dtype=torch.long, device=device)
 
         if cuda_runner is not None and cuda_runner.graph is not None:
-            # CUDA graph replay path
+            # CUDA graph replay path (only when not using sparse)
             outputs = cuda_runner.replay(
                 beam_input_ids, beam_position_ids, batch_position,
                 flashinfer_wrapper, PAGE_SIZE, dtype,
@@ -361,8 +450,7 @@ def beam_search(
             flashinfer_wrapper.prepareAttention(
                 "decode", batch_position, PAGE_SIZE, "NONE", kvCachePool.cache_data[0].dtype,
             )
-            outputs = model(
-                beam_input_ids,
+            fwd_kwargs = dict(
                 position_ids=beam_position_ids,
                 past_key_values=None,
                 use_cache=False,
@@ -371,6 +459,9 @@ def beam_search(
                 mode="decode",
                 flashinferWrapper=flashinfer_wrapper,
             )
+            if append_batch_position is not None:
+                fwd_kwargs["append_batch_position"] = append_batch_position
+            outputs = model(beam_input_ids, **fwd_kwargs)
             # Capture graph after first successful decode forward
             if cuda_runner is not None and cuda_runner.graph is None:
                 cuda_runner.capture(

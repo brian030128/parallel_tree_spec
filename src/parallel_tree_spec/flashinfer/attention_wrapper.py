@@ -225,6 +225,7 @@ class BeFlashinferWrapper:
         batchPosition: KvCacheBatchPosition,
         rotaryParams: AttentionRotaryParams,
         layer_idx: int,
+        appendBatchPosition: Optional[KvCacheBatchPosition] = None,
     ):
         """
         Compute attention: pad Q/K/V, append to cache, run attention kernel.
@@ -232,12 +233,16 @@ class BeFlashinferWrapper:
         Args:
             cacheData: single layer's cache [max_pages, 2, page_len, num_heads, head_dim]
             mode: "prefill", "decode", or "tree"
+            appendBatchPosition: If provided, use this batch position for KV cache
+                append instead of batchPosition. This allows sparse attention (plan
+                with sparse pages) while writing KV to the full page list.
         """
         q, k, v = self._pad_qkv(q, k, v)
+        append_pos = appendBatchPosition if appendBatchPosition is not None else batchPosition
         if mode in ("prefill", "tree"):
-            attn_output = self._batchPrefill(q, k, v, cacheData, batchPosition, rotaryParams)
+            attn_output = self._batchPrefill(q, k, v, cacheData, append_pos, rotaryParams)
         elif mode == "decode":
-            attn_output = self._batchDecode(q, k, v, cacheData, batchPosition, rotaryParams)
+            attn_output = self._batchDecode(q, k, v, cacheData, append_pos, rotaryParams)
         else:
             raise ValueError(f"Invalid attention mode: {mode}")
         return self._unpad_attention(attn_output)

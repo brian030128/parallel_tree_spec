@@ -153,6 +153,24 @@ def main():
         help="Verification method: 'traversal' (stochastic, higher acceptance) or 'exact' (greedy argmax) (default: traversal)"
     )
     parser.add_argument(
+        "--sparse-method", type=str, default="none",
+        choices=["none", "pillar"],
+        help="Sparse attention method for draft decode (default: none)"
+    )
+    parser.add_argument(
+        "--sparse-budget-ratio", type=float, default=0.05,
+        help="Fraction of KV pages to keep with sparse attention (default: 0.05)"
+    )
+    parser.add_argument(
+        "--sparse-min-budget", type=int, default=128,
+        help="Minimum tokens to keep with sparse attention (default: 128)"
+    )
+    parser.add_argument(
+        "--sparse-importance", type=str, default="kv_norm",
+        choices=["kv_norm", "qk_score"],
+        help="Importance scoring method for pillar strategy (default: kv_norm)"
+    )
+    parser.add_argument(
         "--output", type=str, default=None,
         help="Output file for results (default: stdout)"
     )
@@ -197,6 +215,11 @@ def main():
     logging.info(f"CUDA graph: {not args.no_cuda_graph}")
     logging.info(f"Verification: {args.verification_method}")
     logging.info(f"Warm-up iters: {args.warmup_iters}")
+    logging.info(f"Sparse method: {args.sparse_method}")
+    if args.sparse_method != "none":
+        logging.info(f"Sparse budget ratio: {args.sparse_budget_ratio}")
+        logging.info(f"Sparse min budget: {args.sparse_min_budget}")
+        logging.info(f"Sparse importance: {args.sparse_importance}")
 
     experiment = BeamSearchExperiment(
         model_name=args.model,
@@ -212,6 +235,10 @@ def main():
         use_cuda_graph=not args.no_cuda_graph,
         warmup_iters=args.warmup_iters,
         verification_method=args.verification_method,
+        sparse_method=args.sparse_method,
+        sparse_budget_ratio=args.sparse_budget_ratio,
+        sparse_min_budget=args.sparse_min_budget,
+        sparse_importance=args.sparse_importance,
     )
 
     results = experiment.run_sweep(prompts, quant_configs)

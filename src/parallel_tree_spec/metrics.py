@@ -26,6 +26,7 @@ class SingleRunMetrics:
     per_depth_accepted: Dict[int, bool] = field(default_factory=dict)
     # depth -> was token at this depth accepted?
     prompt_length: int = 0                       # token length of prompt (0 = unknown)
+    sparse_method: str = "none"                  # sparse attention method used
 
 
 @dataclass

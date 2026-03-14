@@ -13,6 +13,7 @@ Evaluate HQQ-quantized Llama-3.1-8B as a draft model in speculative decoding bea
 - [x] Step 6: HQQ quantization helper (quantization.py)
 - [x] Step 7: Experiment runner (experiment.py)
 - [x] Step 8: Metrics & CLI (metrics.py, scripts/run_experiment.py)
+- [x] Step 9: Sparse attention (sparse_attention/ package)
 
 All implementation complete. Ready for testing on GPU.
 
@@ -34,6 +35,11 @@ parallel_tree_spec/
 │   │   ├── cache_manager.py        # KvCachePool, RequestKvCache, KvCacheBatchPosition
 │   │   ├── attention.py            # FiLlamaAttention
 │   │   └── monkey_patch.py         # apply_flashinfer_kernel_to_llama()
+│   ├── sparse_attention/
+│   │   ├── __init__.py             # Factory: create_strategy()
+│   │   ├── base.py                 # ABC + SparseAttentionConfig
+│   │   ├── noop.py                 # NoopStrategy (full attention baseline)
+│   │   └── pillar.py               # PillarStrategy (Top-K page selection)
 │   ├── tree.py                     # Tree/TreeNode
 │   ├── beam_search.py              # COW paged KV beam search
 │   ├── verification.py             # verify_tree + target tree decoding
@@ -64,6 +70,7 @@ uv run python scripts/run_experiment.py \
 3. **COW beam search**: Beams share prompt KV pages, copy-on-write for diverging paths
 4. **Exact verification**: Greedy argmax matching (do_sample=False)
 5. **Self-contained**: No imports from subspec_v2 or beam_engine
+6. **Pluggable sparse attention**: Page-level KV sparsity during beam decode (pillar strategy), configurable via CLI
 
 ## Source Code References
 
@@ -93,6 +100,14 @@ Code is rewritten from these source files:
 - HQQ quantizes linear weights (QKV, MLP projections)
 - Activations remain FP16
 - FlashInfer operates on FP16 activations — completely unaware of quantization
+
+### Sparse Attention
+- Pluggable via `SparseAttentionStrategy` ABC → `filter_pages()` + `update_importance()`
+- **PillarStrategy**: Top-K pages by importance (kv_norm or qk_score), plus recent window
+- Page filtering only during decode steps; prefill and tree verification use full attention
+- Dual batch positions: sparse for attention `.plan()`, full for `append_kv_cache()`
+- CUDA graphs disabled when sparse is active (dynamic page counts)
+- CLI: `--sparse-method pillar --sparse-budget-ratio 0.05 --sparse-importance kv_norm`
 
 ### Beam Search COW Invariant
 - `node_pages[node_idx]` = ordered list of physical page indices for node's full KV path

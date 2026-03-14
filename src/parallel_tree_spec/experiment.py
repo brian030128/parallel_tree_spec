@@ -23,6 +23,7 @@ from .flashinfer.cache_manager import KvCachePool, RequestKvCache, copy_kv_pages
 from .flashinfer.monkey_patch import apply_flashinfer_kernel_to_llama
 from .metrics import QuantConfigResult, SingleRunMetrics, SweepResults
 from .quantization import make_quant_config, quantize_model
+from .sparse_attention import SparseAttentionConfig, create_strategy
 from .tree import Tree
 from .verification import verify_draft_tree
 
@@ -49,6 +50,10 @@ class BeamSearchExperiment:
         use_cuda_graph: bool = False,
         warmup_iters: int = 1,
         verification_method: str = "traversal",
+        sparse_method: str = "none",
+        sparse_budget_ratio: float = 0.05,
+        sparse_min_budget: int = 128,
+        sparse_importance: str = "kv_norm",
     ):
         self.model_name = model_name
         self.beam_width = beam_width
@@ -70,6 +75,10 @@ class BeamSearchExperiment:
         self.use_cuda_graph = use_cuda_graph
         self.warmup_iters = warmup_iters
         self.verification_method = verification_method
+        self.sparse_method = sparse_method
+        self.sparse_budget_ratio = sparse_budget_ratio
+        self.sparse_min_budget = sparse_min_budget
+        self.sparse_importance = sparse_importance
 
         self.tokenizer = None
         self.target_model = None
@@ -339,6 +348,15 @@ class BeamSearchExperiment:
             use_cuda_graph=self.use_cuda_graph,
         )
 
+        sparse_config = SparseAttentionConfig(
+            enabled=self.sparse_method != "none",
+            method=self.sparse_method,
+            budget_ratio=self.sparse_budget_ratio,
+            min_budget_tokens=self.sparse_min_budget,
+            importance_method=self.sparse_importance,
+        )
+        strategy = create_strategy(sparse_config)
+
         prefilled_logits = None
         if self.share_kv:
             # Copy target's KV cache to draft pool (with dtype cast)
@@ -363,6 +381,7 @@ class BeamSearchExperiment:
                 flashinfer_wrapper=self.draft_wrapper,
                 prefilled_logits=prefilled_logits,
                 cuda_graph_runner=self.draft_cuda_runner,
+                sparse_strategy=strategy,
             )
         self.draft_cuda_runner = cuda_runner
 
@@ -398,6 +417,7 @@ class BeamSearchExperiment:
             tree_depth=tree.get_depth(),
             target_decode_time=target_decode_time,
             per_depth_accepted=per_depth,
+            sparse_method=self.sparse_method,
         )
 
     def run_sweep(

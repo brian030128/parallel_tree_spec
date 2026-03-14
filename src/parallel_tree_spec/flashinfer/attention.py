@@ -66,6 +66,7 @@ class FiLlamaAttention(nn.Module):
         kvCachePool = kwargs.get("kvCachePool", None)
         mode = kwargs.get("mode", "prefill")
         batch_position = kwargs.get("batch_position", None)
+        append_batch_position = kwargs.get("append_batch_position", None)
 
         rotaryParams = AttentionRotaryParams(pos_encoding_mode=POS_ENCODING_MODE.NONE)
 
@@ -92,6 +93,7 @@ class FiLlamaAttention(nn.Module):
             batch_position,
             rotaryParams,
             self.layer_idx,
+            appendBatchPosition=append_batch_position,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
