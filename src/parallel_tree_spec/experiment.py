@@ -236,6 +236,13 @@ class BeamSearchExperiment:
         assert self.target_model is not None, "Target model not loaded"
         assert self.draft_model is not None, "Draft model not loaded"
 
+        # Ensure Triton kernels for target-side FlashInfer launch on the
+        # correct GPU.  The draft beam search section already switches to
+        # self.draft_device via its own context manager.
+        with torch.cuda.device(self.device):
+            return self._run_single_body(prompt_ids)
+
+    def _run_single_body(self, prompt_ids: torch.Tensor) -> SingleRunMetrics:
         # Reset KV pools
         self.draft_kv_pool.reset()
         self.target_kv_pool.reset()
