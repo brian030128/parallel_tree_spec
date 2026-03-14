@@ -102,7 +102,7 @@ class BeFlashinferWrapper:
             use_tensor_cores=_use_tensor_cores,
             use_cuda_graph=True,
             paged_kv_indptr_buffer=torch.zeros(K + 1, dtype=torch.int32, device=device),
-            paged_kv_indices_buffer=torch.zeros(max_num_pages, dtype=torch.int32, device=device),
+            paged_kv_indices_buffer=torch.zeros(K * max_num_pages, dtype=torch.int32, device=device),
             paged_kv_last_page_len_buffer=torch.zeros(K, dtype=torch.int32, device=device),
         )
 

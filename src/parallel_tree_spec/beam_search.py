@@ -92,7 +92,7 @@ class CudaGraphRunner:
         self.batch_position = KvCacheBatchPosition(
             seq_indptr=torch.arange(K + 1, dtype=torch.int32, device=device),
             kv_page_indptr=torch.zeros(K + 1, dtype=torch.int32, device=device),
-            kv_page_indices=torch.zeros(max_num_pages, dtype=torch.int32, device=device),
+            kv_page_indices=torch.zeros(K * max_num_pages, dtype=torch.int32, device=device),
             kv_last_page_len=torch.zeros(K, dtype=torch.int32, device=device),
             batch_indices=torch.arange(K, dtype=torch.int32, device=device),
             positions=torch.zeros(K, dtype=torch.int32, device=device),

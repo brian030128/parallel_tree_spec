@@ -104,7 +104,11 @@ def main():
     )
     parser.add_argument(
         "--page-len", type=int, default=16,
-        help="KV cache page length (default: 16)"
+        help="KV cache page length for target model (default: 16)"
+    )
+    parser.add_argument(
+        "--draft-page-len", type=int, default=None,
+        help="KV cache page length for draft model (default: max-depth)"
     )
     parser.add_argument(
         "--max-pages", type=int, default=4096,
@@ -195,6 +199,7 @@ def main():
         device=args.device,
         draft_device=args.draft_device,
         page_len=args.page_len,
+        draft_page_len=args.draft_page_len,
         max_pages=args.max_pages,
         share_kv=args.share_kv,
         temperature=args.temperature,

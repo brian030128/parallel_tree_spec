@@ -42,6 +42,7 @@ class BeamSearchExperiment:
         draft_device: Optional[str] = None,
         dtype: torch.dtype = torch.bfloat16,
         page_len: int = 16,
+        draft_page_len: Optional[int] = None,
         max_pages: int = 4096,
         share_kv: bool = False,
         temperature: float = 1.0,
@@ -59,7 +60,10 @@ class BeamSearchExperiment:
             self.draft_device = torch.device("cuda", 0)
         self.dtype = dtype
         self.page_len = page_len
+        self.draft_page_len = draft_page_len if draft_page_len is not None else max_depth
         self.max_pages = max_pages
+        # Scale draft pool page count so total token capacity matches target pool
+        self.draft_max_pages = max_pages * page_len // self.draft_page_len
         self.share_kv = share_kv
         self.temperature = temperature
         self.use_cuda_graph = use_cuda_graph
@@ -150,11 +154,11 @@ class BeamSearchExperiment:
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
         self.draft_kv_pool = KvCachePool(
-            max_pages=self.max_pages,
+            max_pages=self.draft_max_pages,
             num_layers=num_layers,
             num_heads=num_kv_heads,
             head_dim=head_dim,
-            page_len=self.page_len,
+            page_len=self.draft_page_len,
             dtype=torch.float16,
             device=self.draft_device,
         )
@@ -163,7 +167,7 @@ class BeamSearchExperiment:
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=num_kv_heads,
             hidden_size=config.hidden_size,
-            page_len=self.page_len,
+            page_len=self.draft_page_len,
             device=self.draft_device,
         )
 
@@ -188,11 +192,11 @@ class BeamSearchExperiment:
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
 
         self.draft_kv_pool = KvCachePool(
-            max_pages=self.max_pages,
+            max_pages=self.draft_max_pages,
             num_layers=num_layers,
             num_heads=num_kv_heads,
             head_dim=head_dim,
-            page_len=self.page_len,
+            page_len=self.draft_page_len,
             dtype=torch.bfloat16,
             device=self.draft_device,
         )
@@ -201,7 +205,7 @@ class BeamSearchExperiment:
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=num_kv_heads,
             hidden_size=config.hidden_size,
-            page_len=self.page_len,
+            page_len=self.draft_page_len,
             device=self.draft_device,
         )
 
@@ -250,7 +254,7 @@ class BeamSearchExperiment:
         # Create request KV caches
         draft_kv_cache = RequestKvCache(
             kvCachePool=self.draft_kv_pool,
-            page_len=self.page_len,
+            page_len=self.draft_page_len,
             seq_init_len=0,
         )
         target_kv_cache = RequestKvCache(

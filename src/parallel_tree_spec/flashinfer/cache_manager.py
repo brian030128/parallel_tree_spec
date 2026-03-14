@@ -288,7 +288,8 @@ def copy_kv_pages(
     """Copy KV cache pages from source to destination pool.
 
     Creates a new RequestKvCache in dst_pool with the same content as src_request.
-    Handles dtype conversion (e.g. bf16 → fp16) automatically.
+    Handles dtype conversion (e.g. bf16 -> fp16) and different page sizes
+    between source and destination pools automatically.
 
     Args:
         src_pool: Source KV cache pool (e.g. target model's pool)
@@ -298,23 +299,41 @@ def copy_kv_pages(
     Returns:
         New RequestKvCache in dst_pool with copied KV data
     """
-    num_pages = len(src_request.kv_page_indices)
-    if num_pages == 0:
+    seq_len = src_request.kv_len
+    if seq_len == 0:
         return RequestKvCache(
             kvCachePool=dst_pool,
             page_len=dst_pool.page_len,
             seq_init_len=0,
         )
 
-    # Allocate pages in destination
-    dst_pages = dst_pool.allocate(num_pages)
+    src_page_len = src_pool.page_len
+    dst_page_len = dst_pool.page_len
 
-    # Copy page data with dtype conversion
-    for src_page, dst_page in zip(src_request.kv_page_indices, dst_pages):
-        dst_pool.cache_data[:, dst_page].copy_(
-            src_pool.cache_data[:, src_page].to(dst_pool.dtype),
-            non_blocking=True,
-        )
+    dst_num_pages = math.ceil(seq_len / dst_page_len)
+    dst_pages = dst_pool.allocate(dst_num_pages)
+
+    if src_page_len == dst_page_len:
+        # Fast path: 1:1 page copy
+        for src_page, dst_page in zip(src_request.kv_page_indices, dst_pages):
+            dst_pool.cache_data[:, dst_page].copy_(
+                src_pool.cache_data[:, src_page].to(dst_pool.dtype),
+                non_blocking=True,
+            )
+    else:
+        # Different page sizes: copy token-by-token across page boundaries
+        # cache_data shape: [num_layers, max_pages, 2, page_len, num_heads, head_dim]
+        for tok in range(seq_len):
+            src_page_idx = tok // src_page_len
+            src_slot = tok % src_page_len
+            dst_page_idx = tok // dst_page_len
+            dst_slot = tok % dst_page_len
+            src_phys = src_request.kv_page_indices[src_page_idx]
+            dst_phys = dst_pages[dst_page_idx]
+            dst_pool.cache_data[:, dst_phys, :, dst_slot].copy_(
+                src_pool.cache_data[:, src_phys, :, src_slot].to(dst_pool.dtype),
+                non_blocking=True,
+            )
 
     # Build a RequestKvCache that mirrors the source's state
     dst_request = RequestKvCache(
@@ -323,7 +342,7 @@ def copy_kv_pages(
         seq_init_len=0,
     )
     dst_request.kv_page_indices = dst_pages
-    dst_request.kv_len = src_request.kv_len
-    dst_request.kv_last_page_len = src_request.kv_last_page_len
+    dst_request.kv_len = seq_len
+    dst_request.kv_last_page_len = (seq_len - 1) % dst_page_len + 1
 
     return dst_request
