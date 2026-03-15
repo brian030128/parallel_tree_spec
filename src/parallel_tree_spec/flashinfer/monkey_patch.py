@@ -16,6 +16,7 @@ from transformers import PreTrainedModel
 from transformers.models.llama.modeling_llama import LlamaAttention
 
 from .attention import FiLlamaAttention
+from .modeling_llama import llama_causal_lm_forward, llama_model_forward
 
 try:
     from flashinfer.norm import fused_add_rmsnorm, rmsnorm
@@ -106,6 +107,13 @@ def apply_flashinfer_kernel_to_llama(
 
     if rms_norm and _HAS_FI_RMSNORM:
         _patch_rms_norm_module(base_model.norm)
+
+    # Patch out causal mask computation (FlashInfer handles masking internally)
+    if attention:
+        _bind_method_to_module(base_model, "forward", llama_model_forward)
+        if base_model is not model:
+            # model is a CausalLM wrapper around base_model
+            _bind_method_to_module(model, "forward", llama_causal_lm_forward)
 
     for decoder_layer in base_model.layers:
         if rms_norm and _HAS_FI_RMSNORM:
