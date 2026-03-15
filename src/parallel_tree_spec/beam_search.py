@@ -125,6 +125,57 @@ def _build_beam_batch_position(
     )
 
 
+class StaticBatchPosition:
+    """Pre-allocated batch position buffers to avoid per-step tensor creation.
+
+    Uses pinned CPU staging buffers with async copy to GPU, eliminating
+    the implicit CUDA sync from ``torch.tensor(..., device='cuda')``.
+    """
+
+    def __init__(self, K: int, max_pages_per_beam: int, device: torch.device):
+        max_idx = K * max_pages_per_beam
+        # Pinned CPU staging (async-copyable to GPU)
+        self._cpu_indices = torch.zeros(max_idx, dtype=torch.int32).pin_memory()
+        self._cpu_indptr = torch.zeros(K + 1, dtype=torch.int32).pin_memory()
+        # GPU destination buffers
+        self._gpu_indices = torch.zeros(max_idx, dtype=torch.int32, device=device)
+        self._gpu_indptr = torch.zeros(K + 1, dtype=torch.int32, device=device)
+        # Constant across decode steps
+        self._seq_indptr = torch.arange(K + 1, dtype=torch.int32, device=device)
+        self._batch_indices = torch.arange(K, dtype=torch.int32, device=device)
+        self._last_page_len = torch.zeros(K, dtype=torch.int32, device=device)
+        self._positions = torch.zeros(K, dtype=torch.int32, device=device)
+
+    def fill(
+        self,
+        beam_pages_list: List[List[int]],
+        current_pos: int,
+        page_size: int,
+    ) -> KvCacheBatchPosition:
+        """Populate buffers from beam page lists and return a batch position."""
+        K = len(beam_pages_list)
+        off = 0
+        for i, pages in enumerate(beam_pages_list):
+            self._cpu_indptr[i] = off
+            n = len(pages)
+            self._cpu_indices[off:off + n] = torch.as_tensor(pages, dtype=torch.int32)
+            off += n
+        self._cpu_indptr[K] = off
+        # Async copy pinned → GPU (no implicit sync)
+        self._gpu_indptr[:K + 1].copy_(self._cpu_indptr[:K + 1], non_blocking=True)
+        self._gpu_indices[:off].copy_(self._cpu_indices[:off], non_blocking=True)
+        self._last_page_len.fill_(current_pos % page_size + 1)
+        self._positions.fill_(current_pos)
+        return KvCacheBatchPosition(
+            seq_indptr=self._seq_indptr,
+            kv_page_indptr=self._gpu_indptr[:K + 1],
+            kv_page_indices=self._gpu_indices[:off],
+            kv_last_page_len=self._last_page_len,
+            batch_indices=self._batch_indices,
+            positions=self._positions,
+        )
+
+
 # ---------------------------------------------------------------------------
 # CUDA graph runner
 # ---------------------------------------------------------------------------
@@ -403,6 +454,11 @@ def beam_search(
     tree.available_leaves = list(beam_node)
     cum_log_probs = torch.log(topk_probs).tolist()
 
+    # --- Pre-allocate static batch position buffers ---
+    max_pages_per_beam = len(prompt_pages) + max_depth
+    static_bp = StaticBatchPosition(K, max_pages_per_beam, device)
+    static_bp_sparse = StaticBatchPosition(K, max_pages_per_beam, device) if use_sparse else None
+
     # --- Decode loop ---
     current_pos = kv_len
     for step in range(max_depth - 1):
@@ -410,13 +466,15 @@ def beam_search(
         off = current_pos % PAGE_SIZE
         pli = current_pos // PAGE_SIZE
 
-        # COW enforcement
-        for node_idx in set(beam_node):
-            if off == 0:
-                new_page = kvCachePool.allocate(1)[0]
+        # COW enforcement (batch allocation when starting a new page)
+        unique_nodes = list(set(beam_node))
+        if off == 0:
+            new_pages = kvCachePool.allocate(len(unique_nodes))
+            for node_idx, new_page in zip(unique_nodes, new_pages):
                 node_pages[node_idx].append(new_page)
                 page_ref_counts[new_page] = 1
-            else:
+        else:
+            for node_idx in unique_nodes:
                 write_page = node_pages[node_idx][pli]
                 if page_ref_counts[write_page] > 1:
                     new_page = _copy_block(kvCachePool, write_page, off)
@@ -429,7 +487,7 @@ def beam_search(
 
         # Build FULL batch position for K beams (used for KV append)
         beam_pages_list = [node_pages[beam_node[k]] for k in range(K)]
-        full_batch_position = _build_beam_batch_position(beam_pages_list, current_pos, PAGE_SIZE, device)
+        full_batch_position = static_bp.fill(beam_pages_list, current_pos, PAGE_SIZE)
 
         # Build SPARSE batch position for attention (if sparse strategy active)
         append_batch_position = None
@@ -438,7 +496,7 @@ def beam_search(
                 sparse_strategy.filter_pages(pages, seq_len=current_pos, page_len=PAGE_SIZE)
                 for pages in beam_pages_list
             ]
-            sparse_batch_position = _build_beam_batch_position(sparse_pages_list, current_pos, PAGE_SIZE, device)
+            sparse_batch_position = static_bp_sparse.fill(sparse_pages_list, current_pos, PAGE_SIZE)
             # Attention uses sparse pages; KV append uses full pages
             batch_position = sparse_batch_position
             append_batch_position = full_batch_position
