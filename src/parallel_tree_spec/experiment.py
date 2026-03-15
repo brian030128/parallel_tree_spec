@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 import urllib.request
 from pathlib import Path
@@ -54,6 +55,7 @@ class BeamSearchExperiment:
         sparse_budget_ratio: float = 0.05,
         sparse_min_budget: int = 128,
         sparse_importance: str = "kv_norm",
+        profile: bool = False,
     ):
         self.model_name = model_name
         self.beam_width = beam_width
@@ -79,6 +81,8 @@ class BeamSearchExperiment:
         self.sparse_budget_ratio = sparse_budget_ratio
         self.sparse_min_budget = sparse_min_budget
         self.sparse_importance = sparse_importance
+        self.profile = profile
+        self._profiled = False  # only profile the first non-warmup run
 
         self.tokenizer = None
         self.target_model = None
@@ -257,6 +261,7 @@ class BeamSearchExperiment:
         with torch.cuda.device(self.device):
             return self._run_single_body(prompt_ids)
 
+    @torch.inference_mode()
     def _run_single_body(self, prompt_ids: torch.Tensor) -> SingleRunMetrics:
         # Reset KV pools
         self.draft_kv_pool.reset()
@@ -372,17 +377,38 @@ class BeamSearchExperiment:
         # on the tensor's device.  After target prefill the current device is
         # self.device; we must switch to draft_device so Triton targets the
         # correct GPU.
-        with torch.cuda.device(self.draft_device):
-            tree, step_times, cuda_runner = beam_search(
-                model=self.draft_model,
-                request_kv_cache=draft_kv_cache,
-                input_ids=prompt_ids.to(self.draft_device),
-                config=beam_config,
-                flashinfer_wrapper=self.draft_wrapper,
-                prefilled_logits=prefilled_logits,
-                cuda_graph_runner=self.draft_cuda_runner,
-                sparse_strategy=strategy,
+        do_profile = self.profile and not self._profiled
+        if do_profile:
+            from torch.profiler import profile as torch_profile, ProfilerActivity
+            os.makedirs("traces", exist_ok=True)
+            prof_ctx = torch_profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                with_stack=True,
             )
+        else:
+            from contextlib import nullcontext
+            prof_ctx = nullcontext()
+
+        with prof_ctx as prof:
+            with torch.cuda.device(self.draft_device):
+                tree, step_times, cuda_runner = beam_search(
+                    model=self.draft_model,
+                    request_kv_cache=draft_kv_cache,
+                    input_ids=prompt_ids.to(self.draft_device),
+                    config=beam_config,
+                    flashinfer_wrapper=self.draft_wrapper,
+                    prefilled_logits=prefilled_logits,
+                    cuda_graph_runner=self.draft_cuda_runner,
+                    sparse_strategy=strategy,
+                )
+
+        if do_profile:
+            trace_path = "traces/beam_search_trace.json"
+            prof.export_chrome_trace(trace_path)
+            logger.info(f"Profiler trace saved to {trace_path}")
+            self._profiled = True
+
         self.draft_cuda_runner = cuda_runner
 
         # --- Verify: target model scores the tree ---

@@ -175,6 +175,10 @@ def main():
         help="Output file for results (default: stdout)"
     )
     parser.add_argument(
+        "--profile", action="store_true",
+        help="Enable torch.profiler around the first non-warmup beam search (saves Chrome trace to traces/)"
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Verbose logging"
     )
@@ -240,6 +244,7 @@ def main():
         sparse_budget_ratio=args.sparse_budget_ratio,
         sparse_min_budget=args.sparse_min_budget,
         sparse_importance=args.sparse_importance,
+        profile=args.profile,
     )
 
     results = experiment.run_sweep(prompts, quant_configs)
